@@ -16,9 +16,11 @@ to Linear Customers. Reading it is not required to work on this repo.
 - **Core extracted.** Plan, drift detection by content hash, check-and-set apply,
   and `run_check` with its exit codes, driven entirely through the `Adapter`
   protocol. Tests cover every path with an in-memory toy adapter.
-- **Adopted by the first consumer (2026-10-21).** `customer-registry-sync` now runs
-  its plan and check on this engine through its own adapter, with no behavior
-  change.
+- **Adopted by the first consumer (2026-10-21).** `customer-registry-sync` first ran
+  its plan and check on this engine through its own adapter. It now uses the engine
+  for drift detection (`detect_drift`) and the `check` exit codes only. Its
+  field-level planning and apply run locally; see "Seams found while porting
+  customer-registry-sync" below.
 
 ## Planned engine features
 
@@ -74,3 +76,33 @@ to Linear Customers. Reading it is not required to work on this repo.
   observe, record, check, apply, re-record loop in CI.
 - [ ] **Packaging and publishing.** Tagged releases and a changelog; decide whether
   to publish to PyPI or stay a git URL dependency.
+
+## Seams found while porting customer-registry-sync
+
+The field-level planner ported into `customer-registry-sync` runs its own plan and
+apply. From the engine it imports only `detect_drift`, `DriftReport`, `SyncMark` and the
+`EXIT_*` codes; it has its own `run_check`. It bypasses `Adapter`, `make_plan` and `apply` in
+each place below, because the v0.1.0 contract has no seam for it. Each is a candidate
+engine feature.
+
+- [ ] **Field-level changes.** `make_plan` compares whole-record hashes and
+  `Adapter.update` writes the whole record. The planner needs one change per field
+  under an ownership rule, and sends only the changed fields.
+- [ ] **Many-to-one pairing.** `Adapter.match` returns one live row per desired row.
+  The planner pairs by identity: several live rows can share one identity, one of
+  them is written, and the rest are reported as known duplicates or as an error.
+- [ ] **Snapshot and restore.** `apply` has no hook before the first write. The
+  planner snapshots every row it will update, records each written version, and a
+  `restore` command writes the snapshot back with check-and-set.
+- [ ] **Post-write verification.** `apply` returns what was written and does not
+  compare it with what was intended. The planner checks each returned row against
+  the target and stops at the first mismatch or error.
+- [ ] **Never-null write guard.** `Adapter.update` has no notion of a destructive
+  write. The planner marks a clear or removal as a retire, and the client refuses to
+  send null or empty values without that mark.
+- [ ] **Manifests.** The engine has no record of generated files. The consumer
+  keeps hash manifests beside its generated output, and `check` fails on hand edits
+  and stale output.
+- [ ] **Reusable deploy and refresh workflow.** Approval-gated apply, a state pull
+  request after apply, and a scheduled refresh live in the consumer's workflow; the
+  engine has nothing to share them through.
