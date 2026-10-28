@@ -1,0 +1,538 @@
+name: sync
+
+# Reusable workflow: applies reviewed definitions in git to a live system behind an
+# approval gate, and refreshes the files derived from the live system. A repository
+# adopts it with a short caller (push to main, dispatch, daily schedule) that passes
+# each secret explicitly by name.
+#
+# - Callable only when this repository is public, or has the same owner as the
+#   caller (with Actions access granted to it in its settings).
+# - The tool: the caller's repository holds a uv project (input `project_dir`, with a
+#   committed uv.lock) that depends on the consumer's command-line tool, and input
+#   `command` is that tool's executable name. Each job runs `uv sync --locked` there
+#   and calls the tool through `uv run --frozen`, so the caller's lock pins the tool
+#   and every transitive dependency, the same in every job. The tool implements the
+#   CLI contract in docs/cli-contract.md; this workflow calls it only through that
+#   contract and holds no knowledge of what the tool syncs. The lock must use https
+#   git URLs or an index: the jobs hold no deploy key.
+# - Settings come from the tool, through `config-get`: the data directory, the state
+#   and snapshot directories, both environment names and the e2e test path. The
+#   config file is input `config`. `config-get` fails naming any key it cannot answer.
+#   A value that contains a newline is refused before it reaches a step output.
+# - Token: the tool reads its destination token from an environment variable whose
+#   name is input `token-env`. The workflow holds the token under a neutral name
+#   (GITOPS_TOKEN) and the wrapper it installs exports it as `token-env` for each
+#   call, so the name needs no expression in an env key.
+# - `e2e` runs the tool's live tests from the exact source the lock installed (git URL
+#   and commit, or local directory, read by `tool-source`), never another ref. The test
+#   path comes from `config-get e2e_tests`; a path with a `..` segment, an absolute
+#   path or one that starts with `-` is refused.
+# - Modes: on a push, `plan` runs `changed --since <before>` and ends the run when
+#   no deploy input changed (this replaces a hard-coded `on.push.paths` list, which
+#   GitHub cannot read from a file); a push that changed one runs `deploy`. The
+#   schedule runs `refresh`. A dispatch runs its `mode` input: `deploy`, `restore`
+#   (put values back from a snapshot), `e2e` (the live test, no state PR) or
+#   `refresh`.
+# - `refresh` reads the live system with the read-only token, runs `refresh
+#   --no-input` (the one step that holds the token, because the command runs
+#   `sync-inbound`; the tool must not give it to the offline steps), and opens one PR with the result as the GitHub App. It runs in the
+#   read-only environment, so the scheduled run waits for no approval, and it never
+#   runs `check` or writes to the live system. Merging its PR changes the desired
+#   files, so the merge push runs `deploy` behind its gate.
+# - `deploy` and `refresh` use separate concurrency groups (set on each job, not on
+#   the workflow), each suffixed with the `config` input so two configs in one
+#   repository never queue behind each other. GitHub keeps one running and one
+#   pending run per group, and a newer pending run cancels the older one even with
+#   `cancel-in-progress: false`. In one shared group the daily refresh would cancel
+#   a push-triggered deploy that waits for approval. Neither job writes to the base
+#   branch (each opens its own PR branch) and `check` re-reads the live system, so
+#   they can overlap safely.
+# - The deploy environment holds the required-reviewer approval and the write token
+#   (DESTINATION_TOKEN); the read-only environment holds DESTINATION_READONLY_TOKEN.
+#   Tokens are passed only to the steps that call the destination, never at job
+#   level, so checkout, upload and the PR steps never see them.
+# - Secrets are declared under `on.workflow_call.secrets` and passed by the caller
+#   by name (`secrets: inherit` passes nothing across owners). A secret of the same
+#   name stored in a job's environment takes precedence over the passed one, so the
+#   tokens stay environment secrets: the write token is released only after a
+#   required reviewer approves, and the caller does not pass either token.
+# - The job token is read-only. The state and refresh PRs are pushed and opened
+#   with a GitHub App token so their CI runs (a PR opened with GITHUB_TOKEN
+#   triggers no checks).
+# - Inputs, outputs and secrets reach scripts through `env:`, never as `${{ }}`
+#   inside `run:`, so a crafted input cannot inject commands.
+# - The state PR commit touches only the state directory and the snapshots, which
+#   are not deploy inputs, so merging it ends at `plan`. After a retire apply, the
+#   reviewer pushes the deletion of the applied retire entry onto the state PR
+#   branch; that is a deploy input, so the merge runs `deploy`, which plans a
+#   no-op apply the reviewer may approve or reject.
+
+on:
+  workflow_call:
+    inputs:
+      project_dir:
+        description: "uv project (pyproject.toml + uv.lock) that depends on the tool, relative to the repository root"
+        type: string
+        required: false
+        default: "."
+      command:
+        description: "the tool's executable name, as installed by the uv project"
+        type: string
+        required: true
+      token-env:
+        description: "name of the environment variable the tool reads its destination token from"
+        type: string
+        required: true
+      config:
+        description: "config file, relative to the repository root"
+        type: string
+        required: false
+        default: registry-sync.yaml
+      mode:
+        description: "deploy, restore, e2e or refresh. Empty: refresh on a schedule, deploy otherwise."
+        type: string
+        required: false
+        default: ""
+      snapshot:
+        description: "restore only: snapshot file under the snapshot directory, relative to the repository root; it must already be merged via a state PR"
+        type: string
+        required: false
+        default: ""
+      rows:
+        description: "restore only: space-separated ids to restore (empty restores every row)"
+        type: string
+        required: false
+        default: ""
+      base_branch:
+        description: "branch the state and refresh PRs target"
+        type: string
+        required: false
+        default: main
+    # Each is optional because no mode needs all of them; a step that needs a
+    # missing one fails (the tool names its token variable, the App token action its
+    # inputs).
+    secrets:
+      DESTINATION_TOKEN:
+        description: "token with write scope (deploy, restore, e2e); keep it in the deploy environment"
+        required: false
+      DESTINATION_READONLY_TOKEN:
+        description: "read-only token (refresh); keep it in the read-only environment"
+        required: false
+      APP_ID:
+        description: "id of the GitHub App that opens the state and refresh PRs"
+        required: false
+      APP_PRIVATE_KEY:
+        description: "private key of that GitHub App"
+        required: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      run: ${{ steps.decide.outputs.run }}
+      mode: ${{ steps.decide.outputs.mode }}
+      deploy_environment: ${{ steps.settings.outputs.deploy_environment }}
+      readonly_environment: ${{ steps.settings.outputs.readonly_environment }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # `changed --since` diffs against the push's `before` commit.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
+
+      - name: Install the tool
+        env:
+          PROJECT_DIR: ${{ inputs.project_dir }}
+          COMMAND: ${{ inputs.command }}
+          CONFIG: ${{ inputs.config }}
+          TOKEN_ENV: ${{ inputs.token-env }}
+        run: &install |
+          set -euo pipefail
+          case "$PROJECT_DIR$COMMAND$CONFIG$TOKEN_ENV" in
+            *$'\n'*) echo "project_dir, command, config and token-env must be single-line values" >&2; exit 2 ;;
+          esac
+          if ! [[ "$TOKEN_ENV" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+            echo "token-env must be an environment variable name" >&2
+            exit 2
+          fi
+          if ! [[ "$COMMAND" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+            echo "command must be an executable name, not a path" >&2
+            exit 2
+          fi
+          uv sync --locked --project "$PROJECT_DIR"
+          mkdir -p "$RUNNER_TEMP/bin"
+          cat > "$RUNNER_TEMP/bin/gitops-tool" <<'SH'
+          #!/bin/sh
+          if [ -n "${GITOPS_TOKEN:-}" ]; then
+            export "$GITOPS_TOKEN_ENV=$GITOPS_TOKEN"
+            unset GITOPS_TOKEN
+          fi
+          exec uv run --frozen --project "$GITOPS_PROJECT" "$GITOPS_COMMAND" --config "$GITOPS_CONFIG" "$@"
+          SH
+          chmod +x "$RUNNER_TEMP/bin/gitops-tool"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+          {
+            echo "GITOPS_PROJECT=$PROJECT_DIR"
+            echo "GITOPS_COMMAND=$COMMAND"
+            echo "GITOPS_CONFIG=$CONFIG"
+            echo "GITOPS_TOKEN_ENV=$TOKEN_ENV"
+          } >> "$GITHUB_ENV"
+
+      - name: Decide the mode and whether to run
+        id: decide
+        env:
+          EVENT: ${{ github.event_name }}
+          MODE_INPUT: ${{ inputs.mode }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = "schedule" ]; then
+            mode=refresh
+          else
+            mode="${MODE_INPUT:-deploy}"
+          fi
+          case "$mode" in
+            deploy|restore|e2e|refresh) ;;
+            *) echo "unknown mode '$mode' (deploy, restore, e2e or refresh)" >&2; exit 2 ;;
+          esac
+          run=true
+          if [ "$EVENT" = "push" ]; then
+            # An unknown or unreachable sha (first push, force-push) reports `changed`.
+            result="$(gitops-tool changed --since "${BEFORE:-}")"
+            echo "Deploy inputs since ${BEFORE:-<none>}: $result"
+            if [ "$result" != "changed" ]; then
+              run=false
+              echo "### sync: no deploy input changed; nothing to do" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          fi
+          {
+            echo "mode=$mode"
+            echo "run=$run"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Read the workflow settings
+        id: settings
+        if: steps.decide.outputs.run == 'true'
+        run: |
+          set -euo pipefail
+          # Plain assignments, so a missing key (exit 2, naming it) fails the step.
+          deploy_environment="$(gitops-tool config-get deploy_environment)"
+          readonly_environment="$(gitops-tool config-get readonly_environment)"
+          for value in "$deploy_environment" "$readonly_environment"; do
+            case "$value" in
+              *$'\n'*) echo "an environment name must be a single line" >&2; exit 2 ;;
+            esac
+          done
+          {
+            echo "deploy_environment=$deploy_environment"
+            echo "readonly_environment=$readonly_environment"
+          } >> "$GITHUB_OUTPUT"
+
+  deploy:
+    needs: plan
+    if: needs.plan.outputs.run == 'true' && needs.plan.outputs.mode != 'refresh'
+    concurrency:
+      group: sync-deploy-${{ inputs.config }}
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    environment: ${{ needs.plan.outputs.deploy_environment }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
+
+      - name: Install the tool
+        env:
+          PROJECT_DIR: ${{ inputs.project_dir }}
+          COMMAND: ${{ inputs.command }}
+          CONFIG: ${{ inputs.config }}
+          TOKEN_ENV: ${{ inputs.token-env }}
+        run: *install
+
+      - name: Locate the directories
+        id: paths
+        run: &locate |
+          set -euo pipefail
+          for key in data_dir state_dir snapshot_dir; do
+            value="$(gitops-tool config-get "$key")"
+            case "$value" in
+              *$'\n'*) echo "$key must be a single line" >&2; exit 2 ;;
+            esac
+            rel="$(realpath -m --relative-to="$GITHUB_WORKSPACE" "$value")"
+            case "$rel" in
+              ..|../*) echo "$key $value is outside the repository" >&2; exit 2 ;;
+            esac
+            echo "$key=$rel" >> "$GITHUB_OUTPUT"
+          done
+
+      - name: check (drift + plan)
+        if: needs.plan.outputs.mode == 'deploy'
+        env:
+          GITOPS_TOKEN: ${{ secrets.DESTINATION_TOKEN }}
+        run: gitops-tool check
+
+      # continue-on-error: a failed or aborted apply still has to upload its
+      # snapshot, refresh the state and open the PR before the job goes red.
+      - name: apply
+        id: apply
+        if: needs.plan.outputs.mode != 'e2e'
+        continue-on-error: true
+        env:
+          GITOPS_TOKEN: ${{ secrets.DESTINATION_TOKEN }}
+          MODE: ${{ needs.plan.outputs.mode }}
+          SNAPSHOT: ${{ inputs.snapshot }}
+          ROWS: ${{ inputs.rows }}
+        run: |
+          set -o pipefail
+          {
+            if [ "$MODE" = "restore" ]; then
+              if [ -z "$SNAPSHOT" ]; then
+                echo "restore needs the snapshot input" >&2
+                exit 2
+              fi
+              # Steps run at the repository root, so a relative snapshot path works as given.
+              args=(restore --from "$SNAPSHOT")
+              if [ -n "$ROWS" ]; then
+                read -r -a row_ids <<< "$ROWS"
+                args+=(--rows "${row_ids[@]}")
+              fi
+              args+=(--prod --no-input)
+              gitops-tool "${args[@]}"
+            else
+              gitops-tool deploy --apply --prod --no-input
+            fi
+          } 2>&1 | tee "$RUNNER_TEMP/apply.txt"
+
+      # The tests are not packaged: fetch them from the exact source the tool was
+      # installed from, so e2e tests the deployed version and never another ref.
+      - name: Fetch the installed tool's tests
+        id: tool
+        if: needs.plan.outputs.mode == 'e2e'
+        run: |
+          set -euo pipefail
+          source_line="$(gitops-tool tool-source)"
+          case "$source_line" in
+            *$'\n'*) echo "tool-source must print a single line" >&2; exit 2 ;;
+          esac
+          read -r kind commit location <<< "$source_line"
+          if [ "$kind" = "git" ]; then
+            dir="$RUNNER_TEMP/tool-source"
+            git clone --quiet --no-checkout -- "$location" "$dir"
+            git -C "$dir" checkout --quiet --detach "$commit"
+          else
+            dir="$location"
+          fi
+          tests="$(gitops-tool config-get e2e_tests)"
+          case "$tests" in
+            *$'\n'*|-*|/*|..|../*|*/../*|*/..) echo "e2e_tests must be a path inside the tool's source" >&2; exit 2 ;;
+          esac
+          case "$dir" in
+            *$'\n'*) echo "the tool's source directory must be a single line" >&2; exit 2 ;;
+          esac
+          echo "Testing the tool from $kind $location ${commit}"
+          {
+            echo "dir=$dir"
+            echo "tests=$tests"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: e2e (live test)
+        if: needs.plan.outputs.mode == 'e2e'
+        working-directory: ${{ steps.tool.outputs.dir }}
+        env:
+          GITOPS_TOKEN: ${{ secrets.DESTINATION_TOKEN }}
+          TESTS: ${{ steps.tool.outputs.tests }}
+        run: |
+          set -euo pipefail
+          export "$GITOPS_TOKEN_ENV=$GITOPS_TOKEN"
+          unset GITOPS_TOKEN
+          uv run --locked pytest "$TESTS" --run-live -q
+
+      - name: Upload the snapshots
+        if: always() && steps.apply.outcome != 'skipped'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: snapshots-${{ github.run_id }}
+          path: ${{ steps.paths.outputs.snapshot_dir }}/
+          if-no-files-found: warn
+
+      - name: Refresh the inbound state
+        if: always() && steps.apply.outcome != 'skipped'
+        env:
+          GITOPS_TOKEN: ${{ secrets.DESTINATION_TOKEN }}
+        run: gitops-tool sync-inbound --no-input
+
+      - name: Summarize the apply
+        if: always() && steps.apply.outcome != 'skipped'
+        env:
+          OUTCOME: ${{ steps.apply.outcome }}
+        run: |
+          {
+            echo "### sync: apply ${OUTCOME}"
+            echo '```'
+            cat "$RUNNER_TEMP/apply.txt" 2>/dev/null || echo "(the apply step wrote no output)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: App token for the state PR
+        id: app-token
+        if: always() && steps.apply.outcome != 'skipped'
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Open the state PR
+        if: always() && steps.apply.outcome != 'skipped' && steps.app-token.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+          OUTCOME: ${{ steps.apply.outcome }}
+          MODE: ${{ needs.plan.outputs.mode }}
+          STATE_DIR: ${{ steps.paths.outputs.state_dir }}
+          SNAPSHOT_DIR: ${{ steps.paths.outputs.snapshot_dir }}
+          BASE: ${{ inputs.base_branch }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          bot="${APP_SLUG}[bot]"
+          user_id="$(gh api "/users/${bot}" -q .id)"
+          git config user.name "$bot"
+          git config user.email "${user_id}+${bot}@users.noreply.github.com"
+
+          branch="sync-state/${RUN_ID}-${RUN_ATTEMPT}"
+          git checkout -b "$branch"
+          for dir in "$STATE_DIR" "$SNAPSHOT_DIR"; do
+            if [ -e "$dir" ]; then
+              git add --all -- "$dir"
+            fi
+          done
+          if git diff --cached --quiet; then
+            echo "No state or snapshot changes; no PR to open."
+            exit 0
+          fi
+          git commit -m "chore: state after ${MODE} (run ${RUN_ID})"
+          git push "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" "HEAD:refs/heads/${branch}"
+
+          {
+            echo "Post-${MODE} state from [run ${RUN_ID}](${RUN_URL}): apply outcome \`${OUTCOME}\`."
+            echo
+            echo '```'
+            if [ -f "$RUNNER_TEMP/apply.txt" ]; then
+              head -c 60000 "$RUNNER_TEMP/apply.txt"
+            else
+              echo "(the apply step wrote no output)"
+            fi
+            echo '```'
+          } > "$RUNNER_TEMP/pr-body.md"
+          gh pr create \
+            --repo "$REPO" \
+            --base "$BASE" \
+            --head "$branch" \
+            --title "chore: state after ${MODE} (run ${RUN_ID})" \
+            --body-file "$RUNNER_TEMP/pr-body.md"
+
+      # The apply step is continue-on-error so the steps above always run; this
+      # step turns its failure back into a red job.
+      - name: Fail if the apply failed
+        if: always() && steps.apply.outcome == 'failure'
+        run: |
+          echo "The apply step failed; see the apply step and the state PR." >&2
+          exit 1
+
+  refresh:
+    needs: plan
+    if: needs.plan.outputs.run == 'true' && needs.plan.outputs.mode == 'refresh'
+    concurrency:
+      group: sync-refresh-${{ inputs.config }}
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    environment: ${{ needs.plan.outputs.readonly_environment }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
+
+      - name: Install the tool
+        env:
+          PROJECT_DIR: ${{ inputs.project_dir }}
+          COMMAND: ${{ inputs.command }}
+          CONFIG: ${{ inputs.config }}
+          TOKEN_ENV: ${{ inputs.token-env }}
+        run: *install
+
+      - name: Locate the directories
+        id: paths
+        run: *locate
+
+      - name: Refresh the derived files
+        env:
+          GITOPS_TOKEN: ${{ secrets.DESTINATION_READONLY_TOKEN }}
+        run: gitops-tool refresh --no-input
+
+      - name: App token for the refresh PR
+        id: app-token
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Open the refresh PR
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+          DATA_DIR: ${{ steps.paths.outputs.data_dir }}
+          BASE: ${{ inputs.base_branch }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          bot="${APP_SLUG}[bot]"
+          user_id="$(gh api "/users/${bot}" -q .id)"
+          git config user.name "$bot"
+          git config user.email "${user_id}+${bot}@users.noreply.github.com"
+
+          branch="sync-refresh/${RUN_ID}-${RUN_ATTEMPT}"
+          git checkout -b "$branch"
+          # `refresh` writes only under the data directory, and the checkout was clean.
+          if [ -e "$DATA_DIR" ]; then
+            git add --all -- "$DATA_DIR"
+          fi
+          if git diff --cached --quiet; then
+            echo "No refreshed files changed; no PR to open."
+            exit 0
+          fi
+          git commit -m "chore: refresh derived files (run ${RUN_ID})"
+          git push "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" "HEAD:refs/heads/${branch}"
+
+          {
+            echo "Refresh from [run ${RUN_ID}](${RUN_URL}): \`refresh --no-input\`."
+            echo
+            echo "Review the diff, then merge. The merge changes deploy inputs, so it runs \`deploy\` behind its approval gate."
+          } > "$RUNNER_TEMP/pr-body.md"
+          gh pr create \
+            --repo "$REPO" \
+            --base "$BASE" \
+            --head "$branch" \
+            --title "chore: refresh derived files (run ${RUN_ID})" \
+            --body-file "$RUNNER_TEMP/pr-body.md"
