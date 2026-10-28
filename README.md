@@ -1,28 +1,36 @@
 # gitops-engine
 
-Reconcile a dataset kept in git against a live external system. The engine computes
-a plan, detects drift, and applies writes with a write-time version check. It knows
-nothing about any specific system; you supply an `Adapter`.
+Reconcile records kept in git with a live external system. The engine plans by
+identity and per-field policy, detects drift, applies writes under a check-and-set with
+a snapshot, verifies each write, and restores from a snapshot. It knows nothing about
+any specific system. A consumer supplies a record schema and a destination.
 
 ## Why, and who it is for
 
 Use it when a list of records (accounts, DNS records, feature flags, rows in a SaaS
-tool) should be reviewed in pull requests and then pushed to a system that people
-also edit by hand. The engine answers three questions: what would a deploy change,
-has the external system moved since we last looked, and can we write without
-clobbering someone else's edit. You write the adapter for your system; the engine
-supplies the decision rules and the exit codes a CI gate keys off.
+tool) should be reviewed in pull requests and then pushed to a system that people also
+edit by hand. The engine answers four questions: what would a deploy change, has the
+destination moved since we last looked, can we write without clobbering someone else's
+edit, and did the write land as intended. The consumer supplies the system-specific
+parts; the engine supplies the decision rules, the file formats and the exit codes a CI
+gate keys off.
+
+A second sync (any source, any destination) needs only a record schema with its field
+policies, a destination client, and a command-line tool that implements the
+[CLI contract](docs/cli-contract.md).
 
 ## Install
 
-Requires Python 3.12 or newer. The package is not on PyPI; depend on it by git URL,
-pinned to a tag:
+Requires Python 3.12 or newer. The package is not on PyPI. Depend on it by https git
+URL, pinned to a tag:
 
 ```toml
 # pyproject.toml
-dependencies = ["gitops-engine @ git+https://github.com/markddavidoff/gitops-engine@v0.1.0"]
+dependencies = ["gitops-engine @ git+https://github.com/markddavidoff/gitops-engine@v0.2.0"]
 ```
 
+v0.2.0 replaces the v0.1 `Adapter` / `make_plan` / `apply` / `run_check` API. There is
+no compatibility layer.
 
 ## Run the example
 
@@ -31,139 +39,200 @@ From a clone:
     uv sync
     uv run python examples/toy.py
 
-It walks the full lifecycle against an in-memory adapter (`examples/toy_adapter.py`)
-and prints the exit code and plan at each step:
+It walks the lifecycle against an in-memory destination (`examples/toy_adapter.py`):
+mirror, check, apply, check again, then an out-of-band edit. It prints the exit code
+and the plan at each step.
 
-    first check: 0 | creates ['cog'] | updates ['gear']
-    after apply: 0 | unchanged ['gear', 'cog']
-    after out-of-band edit: 3 | changed ['gear'] | aborts [('gear', 'drift: live version v9 != state version v-upd (content changed)')]
+## The four row types
 
-## The three record shapes
+- **desired** (`D`): what git says should exist. The source of truth for the fields
+  you manage.
+- **live** (`L`): what the destination reports now. Carries an id and a `version`
+  token (an updatedAt, etag or revision).
+- **state**: a recorded reconciliation point. A desired-shaped row plus a `SyncMark`
+  (`live_id`, `version`, `content_hash`) for the exact live row it was last reconciled
+  against. The state directory is the *mirror* of the destination. A state row with no
+  mark is untracked and proves nothing.
+- **dataset record** (`R`): a source record in a named dataset directory. Datasets are
+  merged by identity into the desired rows.
 
-- **desired**: what git says should exist. The source of truth for the fields you
-  manage.
-- **live**: what the external system currently reports. Carries an identity and a
-  `version` token (an updatedAt, etag, or revision).
-- **state**: a recorded reconciliation point: a record plus a `SyncMark`
-  (`live_id`, `version`, `content_hash`) capturing the exact live row it was last
-  reconciled against. A state row with no mark is *untracked* and proves nothing.
+The engine compares **content hashes** of the planned fields, never the raw `version`.
+A destination often bumps `version` on edits to fields you do not manage. That is a
+benign metadata bump, not drift.
 
-The engine compares **content hashes** of the deployable fields, never the raw
-`version`. An external system often bumps `version` on edits to fields you do not
-manage; that is a benign metadata bump, not drift.
+## What a consumer supplies
 
-## Lifecycle
+### `RecordSchema` (`gitops_engine.schema`)
 
-1. **Observe** the external system: read its rows (your code, usually through your
-   adapter's client).
-2. **Record state**: store one state row per live row, each carrying a `SyncMark`
-   taken from that live row. Keep the state in git next to the desired rows.
-3. **Check** with `run_check`: drift between state and live, plus the plan.
-4. **Apply** the plan with `apply`.
-5. **Re-record** the marks from the live rows `apply` returns, so the next check
-   starts from what was just written.
+One declaration of how the engine reads a record kind:
 
-On the first run nothing has been recorded, so there are no marks and no row can
-abort at plan time. Until state is recorded, every live row counts as **added**
-drift and `run_check` exits 3; recording state (step 2) clears that.
+- `nouns`: a `Nouns(record, records, destination, source, version)` the engine prints
+  in its messages, so a consumer's output carries its own words.
+- `fields`: a tuple of `FieldSpec(name, policy, required=False)`, in plan and verify
+  order.
+- `id_field`: the `Always(unordered=True)` field that carries canonical ids.
+- `snapshot_id_key`, `snapshot_version_key`: the keys a snapshot row stores.
+- Accessors: `desired_value`, `live_value`, `label`, `live_label`, `live_id`,
+  `live_version`, `desired_keys`, `live_keys` (what `resolve` matches on), `mark`,
+  `destination_owned`, `with_values`, `mirror_row`, `live_hash` (equal to the hash in
+  `mark(mirror_row(lv))`), `state_to_live`, `snapshot_row` and `snapshot_values`.
 
-## Plan (`make_plan`)
+The engine holds no record type of its own.
 
-    make_plan(desired, live, state, adapter) -> Plan
+### Field policies
 
-For each desired row the engine asks the adapter to `match` it to a live row:
+Each `FieldSpec` carries one policy:
 
-- no match: **create**;
-- matched, and a mark exists whose `version` differs from live **and** whose
-  recorded hash differs from the live hash: **abort** (the row changed under you
-  since the mark was taken);
-- matched and the desired hash equals the live hash: **unchanged**;
-- otherwise: **update**.
+| Policy | Applies to | Rule |
+|---|---|---|
+| `Always(unordered=False)` | scalars and lists | Desired replaces live. With `unordered`, values compare sorted and every difference is a plain change. |
+| `Union(key, exclusive, item)` | lists | The written value is the desired values plus values that exist only on the destination. Destination-only values are kept and reported as untracked. A destination-only value is dropped only when a retire entry names it. `key` normalises values before comparing (lower case by default), so a spelling that differs only by case plans no change and keeps the live spelling. With `exclusive`, a value another live record already holds is withheld, not written. |
+| `KeepIfUnset` | scalars | When the desired row sets the field, desired wins. When it leaves the field unset, the live value is kept and reported as untracked. |
 
-A live row that no desired row matched is an **orphan**: reported, never deleted.
-Which live row a desired row matches, and what happens when several could, is the
-adapter's choice in `match`; the engine does not pick. (The toy adapter takes the
-first one with the same key.)
+`FieldSpec.required` has two effects:
 
-An orphan is a plan-side fact: a live row with no *desired* row. **Added** drift is
-a state-side fact: a live row with no *state* row. One live row can be both, either,
-or neither.
+- On a destination-owned row whose live value is empty, the planner falls back to the
+  desired value.
+- Post-write verification expects a field with no planned change to equal its value
+  from before the write if the field is `required`, and to equal the plan's target
+  otherwise. So `required` also sets the verification expectation for unplanned
+  fields.
 
-## Drift (`detect_drift`)
+A destination-owned row (`destination_owned`) takes every value from live and writes
+only its canonical id.
 
-    detect_drift(state, live, adapter) -> DriftReport
+### `IdentitySpec` (`gitops_engine.identity`)
 
-Drift is the recorded state no longer matching live, judged by content hash. Three
-classes:
+Declares the identity table's layout and matching: the source names, the ordered
+`MatchKey(field, label, norm, skip_empty)` list, and the key order inside each entry of
+the file. `resolve` tries keys in a fixed order: canonical id, then each source id in
+declared order, then each match key in declared order. The first hit wins, and a
+conflict message names both hits.
 
-- **changed**: a tracked state row whose live row's hash no longer matches the mark;
-- **added**: a live row no tracked state row points at;
-- **deleted**: a tracked state row whose live row is gone.
+### `Destination` (`gitops_engine.destination`)
 
-Untracked state rows (no mark) are skipped.
-
-## Apply (`apply`)
-
-    apply(plan, adapter) -> list of the live rows written
-
-`apply` runs `preflight` first; if it raises, nothing is written. It then performs
-creates, then updates. It never deletes. What it does and does not guarantee:
-
-- **Rows aborted at plan time are skipped; every other row is written.** One abort
-  does not stop the apply, so inspect `plan.aborts` before calling `apply`.
-- **`apply` mutates the plan.** Write-time aborts are appended to `plan.aborts`;
-  inspect it again afterwards.
-- **The write-time check is get-then-update.** Before each update the engine calls
-  `get` and skips the row (appending to `plan.aborts`) if it is gone or its
-  `version` moved since plan time. A write can still land between the `get` and the
-  `update`, so the check is best effort unless your adapter's `update` itself
-  enforces the version (for example with an `If-Match` header).
-- **Creates are unguarded and not idempotent.** A create that runs twice, or races
-  another writer, can produce a duplicate. Make `match` find existing rows reliably.
-- **Not transactional.** A write that raises propagates, and rows already written
-  stay written.
-
-## Check and exit codes (`run_check`)
-
-    run_check(desired, state, live, adapter) -> (code, DriftReport, Plan)
-
-Note the argument order: `make_plan` takes `(desired, live, state, adapter)`, while
-`run_check` takes `(desired, state, live, adapter)`. Both are kept as they are for
-compatibility. The parameter names match, so passing them by keyword avoids mix-ups.
-
-- `EXIT_OK = 0`: in sync, and the plan has no aborts.
-- `EXIT_DRIFT = 3`: drift was found or the plan would abort.
-- `EXIT_OPERROR = 2`: an operational error. The library never returns it. Callers
-  are expected to return it when an operational step fails (authentication,
-  network), so CI can tell "the check could not run" from "the check found drift".
-
-## The Adapter contract
-
-An adapter supplies reads, identity, and writes for one system:
+Where planned writes land. Values travel as dicts keyed by the schema's field names.
 
 | Method | Purpose |
 |---|---|
-| `match(d, live) -> L \| None` | the live row a desired row corresponds to |
-| `desired_hash(d) -> str` | hash of a desired row's deployable fields |
-| `live_hash(lv) -> str` | hash of a live row's deployable fields |
-| `live_id(lv) -> str` | stable identity of a live row |
-| `live_version(lv) -> str` | optimistic-concurrency token of a live row |
-| `mark_for(d, lv, state) -> SyncMark \| None` | the mark recorded for this pair |
-| `state_mark(s) -> SyncMark \| None` | the mark on a state row, or None |
-| `preflight(plan) -> None` | validate before any write; raise to abort |
-| `get(live_id) -> L \| None` | re-read a live row at write time |
-| `create(d) -> L` | create a row; return the live row written |
-| `update(live_id, d) -> L` | update a row; return the live row written |
+| `list_live() -> list[L]` | every live row |
+| `get(live_id) -> L \| None` | one row as it is now, or None |
+| `preflight(writes, *, restoring=False)` | raise `ValueError` before any write when a write would fail to resolve |
+| `create(values) -> L` | create a row; return the live row written |
+| `update(live_id, values, *, retire) -> L` | write exactly `values`; `retire` allows an empty value to clear a field |
 
-The engine locates a state row only through `mark_for` and `state_mark`, so how
-state rows are keyed is the adapter's business. `examples/toy_adapter.py` is a
-complete adapter to copy from.
+A refused or failed write raises `DestinationError`.
+
+## Data files
+
+The engine owns the formats of the files that sit under a consumer's data directory.
+Every file name is a parameter.
+
+| Mechanism | Module | What it does |
+|---|---|---|
+| Datasets | `datasets`, `writers` | One directory per dataset, a `datasets.yaml` priority order, deterministic writers. |
+| Identity table | `identity`, `identity_store` | The table, a comment-preserving appender, ordered-key `resolve`, conflict and integrity checks. |
+| Merge | `merge` | One record per identity. The earliest dataset in priority order wins whole; extra keys gather onto the winner. |
+| Destination-only stubs | `found` | Resolve each managed live row, mint identities for unmatched ones, emit stub records. |
+| Ignore list | `ignore` | Match live rows by id or name prefix; a built-in test prefix applies to unscoped runs. |
+| Retire file | `retire` | Per record, the values to remove, each with its exact current value. The only way a value is ever removed; an entry whose value is already gone is reported stale. |
+| Manifests | `manifest` | A hash manifest beside generated output. `check` fails on hand edits and stale output. |
+| State mirror | `mirror` | Reconcile the live rows into mirror rows with their marks. |
+
+## Plan, check, apply, restore
+
+### Plan (`plan_deploy`)
+
+Pairs each desired row with live rows by identity, then plans each field under its
+policy. Several live rows can share one identity: one primary is written and the rest
+are reported as known duplicates or as an error. A `DeployPlan` holds `creates`,
+`updates` (target row and live row), `aborts`, `orphans`, `unchanged`, `known_duplicates`,
+`withheld`, `notes`, `errors` and `unacked` (destructive changes not yet acknowledged
+by a retire entry). Orphans are reported and never deleted.
+
+### Check (`run_check`)
+
+Drift (state against live, by content hash), the plan, untracked values, stale retire
+entries and the live checks, as one `CheckResult`. Drift classes are **changed**,
+**added** (a live row no tracked state row points at) and **deleted** (a tracked row
+whose live row is gone). With dataset hooks it also fails orphans and live identity
+conflicts, and reports unused identities and records with no identity.
+
+Exit codes (`gitops_engine.exitcodes`):
+
+- `EXIT_OK = 0`: in sync, and the plan has no aborts.
+- `EXIT_DRIFT = 3`: drift was found or the plan would abort.
+- `EXIT_OPERROR = 2`: an operational error. The library never returns it; a tool
+  returns it when a step fails (authentication, network, bad input), so CI can tell
+  "could not run" from "found drift".
+
+### Apply (`apply_deploy`)
+
+Order: refuse a plan with errors or unacknowledged destructive changes, run
+`preflight`, snapshot every live row about to be updated, create rows, then for each
+update re-read the row (check-and-set), match it against the ignore list, abort on
+write-time drift, apply the never-null guard, call `update` with only the planned
+fields, record the written version in the snapshot and verify the row returned.
+
+- **Never-null guard.** A write that holds `None`, `""` or `[]` is refused before the
+  destination is called, unless the change is a retire.
+- **Stop at the first failure.** A destination error, a guard refusal or a
+  verification mismatch stops the apply. Later updates are recorded in `plan.aborts` as
+  not attempted. The engine never deletes.
+- **Not transactional.** Rows already written stay written. Creates are not
+  idempotent; pairing by identity is what keeps a rerun from duplicating a row.
+- **Check-and-set is get-then-update.** A write can land between the re-read and the
+  `update`, so the check is best effort unless the destination's own `update` enforces
+  the version.
+
+### Restore (`restore`)
+
+Writes a snapshot back under the same check-and-set, skipping rows edited since. `rows`
+limits it by canonical id. A row holding an empty value is sent as a retire. Snapshots
+written by v0.1.0 load and restore with the same writes.
+
+## The CLI contract
+
+`.github/workflows/sync.yml` is a reusable workflow that runs a tool's command line and
+knows nothing else about it. A tool implements `config-get`, `changed`, `check`,
+`deploy`, `restore`, `sync-inbound`, `refresh` and `tool-source`, and answers the
+config keys the workflow reads. See [`docs/cli-contract.md`](docs/cli-contract.md) for
+the commands, config keys, exit codes and token model.
+
+## The workflow and its secret model
+
+The caller's repository holds a uv project (input `project_dir`, with a committed
+`uv.lock`) that depends on the tool. Each job runs `uv sync --locked`, then calls the
+tool through `uv run --frozen`, so a job that holds a token runs only locked code. The
+lock must use https git URLs or an index; the jobs hold no deploy key.
+
+Modes: on a push the workflow runs `changed --since` and ends when no deploy input
+changed; otherwise it runs `deploy` behind an approval gate. A schedule runs `refresh`.
+A dispatch runs `deploy`, `restore`, `e2e` or `refresh`. A deploy or refresh opens a
+state or refresh pull request with a GitHub App token, so its checks run.
+
+Secrets:
+
+- The **deploy environment** holds the approval gate and the write token, as the secret
+  `DESTINATION_TOKEN`. The **read-only environment** holds the read-only token, as
+  `DESTINATION_READONLY_TOKEN`. An environment secret takes precedence over a value the
+  caller passes, so the write token is released only after a required reviewer approves
+  the deploy. The caller does not pass either token.
+- The caller passes `APP_ID` and `APP_PRIVATE_KEY` for the pull-request App.
+- The tool reads its token from one environment variable, named by the `token-env`
+  input. The workflow holds the token under a neutral name and exports it under that
+  name for each call.
+- Tokens reach only the steps that call the destination (`check`, `deploy`, `restore`,
+  `sync-inbound`, the live tests, and `refresh`), never job-level `env`, so checkout,
+  upload and pull-request steps never see them.
 
 ## Development
 
     uv sync
     uv run pytest -q
     uv run ruff check . && uv run ruff format --check .
+
+Tests drive the engine only through the toy schema and destination in `examples/`.
 
 ## License
 
