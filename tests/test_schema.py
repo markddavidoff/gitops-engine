@@ -61,7 +61,7 @@ def test_toy_fields_and_nouns():
     assert by_name["status"] == FieldSpec("status", Always(), required=True)
     assert by_name["ids"].policy == Always(unordered=True)
     assert schema.id_field == "ids"
-    assert by_name["tags"].policy == Union(exclusive=True)
+    assert by_name["tags"].policy == Union(exclusive=True, item="tag")
     assert by_name["size"].policy == KeepIfUnset()
 
 

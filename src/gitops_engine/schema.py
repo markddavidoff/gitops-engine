@@ -35,13 +35,14 @@ class SyncMark:
 
 @dataclass(frozen=True)
 class Nouns:
-    """The words the engine prints for the consumer's records, their destination, and
-    the source the desired rows come from."""
+    """The words the engine prints for the consumer's records, their destination, the
+    source the desired rows come from, and the destination's version token."""
 
     record: str = "record"
     records: str = "records"
     destination: str = "destination"
     source: str = "source"
+    version: str = "version"
 
 
 @dataclass(frozen=True)
@@ -59,11 +60,14 @@ class Union:
     """A list field the plan adds to and the destination may add to as well.
 
     `key` normalises a value before values compare (lower-case by default).
-    `exclusive` marks a field whose values belong to one record at a time.
+    `exclusive` marks a field whose values belong to one record at a time: the plan
+    withholds a value another live record already holds. `item` names one value in
+    the messages that report it.
     """
 
     key: Callable[[str], str] = str.lower
     exclusive: bool = False
+    item: str = "value"
 
 
 @dataclass(frozen=True)

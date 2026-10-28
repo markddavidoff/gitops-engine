@@ -99,7 +99,7 @@ class ToySchema:
         FieldSpec("name", Always()),
         FieldSpec("status", Always(), required=True),
         FieldSpec("ids", Always(unordered=True)),
-        FieldSpec("tags", Union(exclusive=True)),
+        FieldSpec("tags", Union(exclusive=True, item="tag")),
         FieldSpec("size", KeepIfUnset()),
     )
     id_field = "ids"
@@ -172,7 +172,8 @@ class ToySchema:
         }
 
     def snapshot_values(self, row: dict[str, Any]) -> dict[str, Any]:
-        return {f.name: row[f.name] for f in self.fields}
+        """Every field, except an empty `status`: a widget cannot clear its status."""
+        return {f.name: row[f.name] for f in self.fields if f.name != "status" or row["status"]}
 
 
 # --- walkthrough (v0.1.0 `Adapter`; removed with it) ---
