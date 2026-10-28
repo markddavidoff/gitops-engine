@@ -507,3 +507,25 @@ def test_locate_step_writes_each_directory(tmp_path):
     code, outputs, err = _run_step(locate, tmp_path, {"GITHUB_WORKSPACE": str(tmp_path)})
     assert code == 0, err
     assert outputs == {"data_dir": "data", "state_dir": "st", "snapshot_dir": "sn"}
+
+
+@pytest.mark.parametrize("key", ["deploy_environment", "readonly_environment"])
+def test_settings_step_refuses_a_multiline_environment(tmp_path, key):
+    settings = _step_named(_load()["jobs"]["plan"], "Read the workflow settings")
+    answers = {"deploy_environment": "deploy-env", "readonly_environment": "read-env"}
+    answers[key] = "name\ninjected=1"
+    _stub_config_tool(tmp_path, answers)
+    code, outputs, err = _run_step(settings, tmp_path, {})
+    assert code == 2, err
+    assert "single line" in err
+    assert outputs == {}
+
+
+def test_settings_step_writes_both_environments(tmp_path):
+    settings = _step_named(_load()["jobs"]["plan"], "Read the workflow settings")
+    _stub_config_tool(
+        tmp_path, {"deploy_environment": "deploy-env", "readonly_environment": "read-env"}
+    )
+    code, outputs, err = _run_step(settings, tmp_path, {})
+    assert code == 0, err
+    assert outputs == {"deploy_environment": "deploy-env", "readonly_environment": "read-env"}

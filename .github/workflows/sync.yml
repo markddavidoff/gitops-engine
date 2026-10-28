@@ -222,6 +222,11 @@ jobs:
           # Plain assignments, so a missing key (exit 2, naming it) fails the step.
           deploy_environment="$(gitops-tool config-get deploy_environment)"
           readonly_environment="$(gitops-tool config-get readonly_environment)"
+          for value in "$deploy_environment" "$readonly_environment"; do
+            case "$value" in
+              *$'\n'*) echo "an environment name must be a single line" >&2; exit 2 ;;
+            esac
+          done
           {
             echo "deploy_environment=$deploy_environment"
             echo "readonly_environment=$readonly_environment"
