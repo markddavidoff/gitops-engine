@@ -168,6 +168,21 @@ def test_tool_is_installed_from_the_locked_project():
         assert "uv tool install" not in runs, name
 
 
+def test_every_uv_run_is_locked_or_frozen():
+    """No step, and so no step that holds a token, runs code the lock file does not pin."""
+    wf = _load()
+    found = 0
+    for name, job in wf["jobs"].items():
+        for line in _runs(job).splitlines():
+            if line.lstrip().startswith("#"):
+                continue
+            for match in re.finditer(r"\buv run\b([^\n]*)", line):
+                found += 1
+                flags = match.group(1).split()
+                assert "--locked" in flags or "--frozen" in flags, f"{name}: {line.strip()}"
+    assert found >= 2, "expected the tool wrapper and the e2e step"
+
+
 def test_no_ssh_key_step():
     """Both repositories are public and the dependency is an https URL: nothing needs a key."""
     text = REUSABLE.read_text()
