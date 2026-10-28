@@ -13,8 +13,9 @@ reads, and writes all go through an `Adapter`. Three record shapes flow through 
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol, TypeVar
+
+from .schema import SyncMark
 
 if TYPE_CHECKING:
     from .plan import Plan
@@ -22,21 +23,6 @@ if TYPE_CHECKING:
 D = TypeVar("D")
 L = TypeVar("L")
 S = TypeVar("S")
-
-
-@dataclass(frozen=True)
-class SyncMark:
-    """The live state a desired row was last reconciled against.
-
-    `version` is the optimistic-concurrency token (an updatedAt, etag, revision…);
-    `content_hash` is the adapter's hash of the deployable fields at that point.
-    Together they let the engine tell a benign metadata bump (version moved, hash
-    unchanged) from real drift (both moved).
-    """
-
-    live_id: str
-    version: str
-    content_hash: str
 
 
 class Adapter(Protocol[D, L]):

@@ -1,10 +1,11 @@
 """gitops-engine: reconcile declarative git definitions against a live system."""
 
-from .adapter import Adapter, SyncMark
+from .adapter import Adapter
 from .apply import apply
 from .drift import DriftReport, detect_drift
 from .exitcodes import EXIT_DRIFT, EXIT_OK, EXIT_OPERROR, run_check
 from .plan import Plan, make_plan
+from .schema import SyncMark
 
 __version__ = "0.1.0"
 

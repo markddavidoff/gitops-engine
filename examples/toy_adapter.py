@@ -1,40 +1,31 @@
-"""A toy adapter over an in-memory dict of "widget" rows.
+"""A toy v0.1.0 adapter over an in-memory dict of "widget" rows.
 
 The engine is domain-free: it only talks to an `Adapter`. This toy adapter is the
 smallest thing that exercises every engine path. A `Widget` is both the desired
 spec and, when it carries a `mark`, a recorded state row (mirroring how a real
 record type carries its last-reconciled mark). A `LiveWidget` is what the external
 system reports, keyed by `live_id` and carrying an opaque `version` token.
+
+The adapter matches on a widget's first id (its "key") and hashes its name and size
+(its "value"). `widget` and `live_widget` build rows in that v0.1.0 shape.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
 
-from gitops_engine.adapter import SyncMark
+from toy import LiveWidget, Widget
 
-
-@dataclass
-class Widget:
-    """Desired spec (and, with `mark` set, a recorded state row)."""
-
-    key: str
-    name: str
-    value: int
-    mark: SyncMark | None = None
+from gitops_engine.schema import SyncMark
 
 
-@dataclass
-class LiveWidget:
-    """A widget as the external system reports it."""
+def widget(key: str, name: str, value: int, mark: SyncMark | None = None) -> Widget:
+    return Widget(name=name, status="active", ids=[key], size=value, mark=mark)
 
-    live_id: str
-    key: str
-    name: str
-    value: int
-    version: str
+
+def live_widget(live_id: str, key: str, name: str, value: int, version: str) -> LiveWidget:
+    return LiveWidget(live_id, name, "active", [key], [], value, version)
 
 
 def content_hash(key: str, name: str, value: int) -> str:
@@ -45,11 +36,11 @@ def content_hash(key: str, name: str, value: int) -> str:
 
 def state_row(lv: LiveWidget) -> Widget:
     """Build the state row recorded after observing a live row."""
-    return Widget(
-        key=lv.key,
-        name=lv.name,
-        value=lv.value,
-        mark=SyncMark(lv.live_id, lv.version, content_hash(lv.key, lv.name, lv.value)),
+    return widget(
+        lv.ids[0],
+        lv.name,
+        lv.size,
+        SyncMark(lv.live_id, lv.version, content_hash(lv.ids[0], lv.name, lv.size)),
     )
 
 
@@ -75,15 +66,15 @@ class ToyAdapter:
     # --- reads / identity ---
     def match(self, d: Widget, live: list[LiveWidget]) -> LiveWidget | None:
         for lv in live:  # first match wins
-            if lv.key == d.key:
+            if lv.ids[0] == d.ids[0]:
                 return lv
         return None
 
     def desired_hash(self, d: Widget) -> str:
-        return content_hash(d.key, d.name, d.value)
+        return content_hash(d.ids[0], d.name, d.size)
 
     def live_hash(self, lv: LiveWidget) -> str:
-        return content_hash(lv.key, lv.name, lv.value)
+        return content_hash(lv.ids[0], lv.name, lv.size)
 
     def live_id(self, lv: LiveWidget) -> str:
         return lv.live_id
@@ -92,7 +83,7 @@ class ToyAdapter:
         return lv.version
 
     def mark_for(self, d: Widget, lv: LiveWidget, state: list[Widget]) -> SyncMark | None:
-        st = next((s for s in state if s.key == d.key), None)
+        st = next((s for s in state if s.ids[0] == d.ids[0]), None)
         if st is None:
             st = next(
                 (s for s in state if s.mark is not None and s.mark.live_id == lv.live_id),
@@ -107,7 +98,7 @@ class ToyAdapter:
     def preflight(self, plan) -> None:
         if self._resolvable is None:
             return
-        needed = {d.key for d in plan.creates} | {d.key for d, _ in plan.updates}
+        needed = {d.ids[0] for d in plan.creates} | {d.ids[0] for d, _ in plan.updates}
         missing = sorted(needed - self._resolvable)
         if missing:
             raise ValueError(f"unresolvable widget(s), nothing written: {missing}")
@@ -116,15 +107,15 @@ class ToyAdapter:
         return self.rows.get(live_id)
 
     def create(self, d: Widget) -> LiveWidget:
-        if d.key == self._fail_create_key:
-            raise RuntimeError(f"create failed for {d.key}")
+        if d.ids[0] == self._fail_create_key:
+            raise RuntimeError(f"create failed for {d.ids[0]}")
         self.created.append(d)
-        lv = LiveWidget(f"new-{d.key}", d.key, d.name, d.value, "v-new")
+        lv = live_widget(f"new-{d.ids[0]}", d.ids[0], d.name, d.size, "v-new")
         self.rows[lv.live_id] = lv
         return lv
 
     def update(self, live_id: str, d: Widget) -> LiveWidget:
         self.updated.append((live_id, d))
-        lv = LiveWidget(live_id, d.key, d.name, d.value, "v-upd")
+        lv = live_widget(live_id, d.ids[0], d.name, d.size, "v-upd")
         self.rows[live_id] = lv
         return lv

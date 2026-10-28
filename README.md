@@ -6,7 +6,7 @@ nothing about any specific system; you supply an `Adapter`.
 
 ## Why, and who it is for
 
-Use it when a list of records (customers, DNS records, feature flags, rows in a SaaS
+Use it when a list of records (accounts, DNS records, feature flags, rows in a SaaS
 tool) should be reviewed in pull requests and then pushed to a system that people
 also edit by hand. The engine answers three questions: what would a deploy change,
 has the external system moved since we last looked, and can we write without
