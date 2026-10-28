@@ -22,7 +22,7 @@ def _write(rows, path, **kw):
 
 
 def test_slugify():
-    assert slugify("Stark Fabrication LLC (The Forge)") == "stark-fabrication-llc-the-forge"
+    assert slugify("Gear Works Ltd (The Foundry)") == "gear-works-ltd-the-foundry"
     assert slugify("  --Ünï  x__y-- ") == "n-x-y"
     assert slugify("!!!") == ""
 
