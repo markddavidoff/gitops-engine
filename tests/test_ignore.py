@@ -76,6 +76,14 @@ def test_match_by_id_survives_rename_and_prefix_is_startswith(tmp_path):
     assert ign.match("L3", "Acme test-", scope=None) is None
 
 
+def test_a_hand_built_list_names_its_file():
+    ign = IgnoreList("ignore.yaml", entries=[IgnoreEntry("L1", None, "r", 3)])
+    assert ign.where(ign.entries[0]) == "ignore.yaml:3"
+    assert stale_ignore(ign, [], SCHEMA) == [
+        "stale ignore entry: ignore.yaml:3: L1 is not in store"
+    ]
+
+
 def test_load_missing_file_has_builtin_prefix_only(tmp_path):
     ign = load_ignore(tmp_path / "missing.yaml", FMT)
     assert ign.entries == [] and [p.line for p in ign.prefixes] == [None]

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import pytest
 import yaml
 from toy import ToySchema
 
@@ -36,12 +35,13 @@ def test_retire_file_format_is_pinned(tmp_path):
     assert path.read_text() == "# only a header\n"
 
 
-def test_retire_rejects_always_field(tmp_path):
+def test_retire_ignores_always_field(tmp_path):
     path = tmp_path / "retire.yaml"
-    for field in ("name", "status", "ids"):
-        path.write_text(f"gear:\n  {field}: x\n")
-        with pytest.raises(ValueError, match=f"gear.*{field}.*cannot be retired"):
-            load_retire(path, SCHEMA)
+    for field in ("name", "status", "ids", "unknown"):
+        path.write_text(f"gear:\n  {field}: x\n  size: 3\n")
+        got = load_retire(path, SCHEMA)  # nothing raises
+        assert got == {"gear": {"tags": [], "size": 3}}
+        assert field not in got["gear"]
 
 
 def test_retire_missing_or_empty_file_is_empty(tmp_path):

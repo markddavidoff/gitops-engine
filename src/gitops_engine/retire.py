@@ -5,8 +5,8 @@
       size: 120000     # a `KeepIfUnset` field: the live value to clear
 
 Every key is optional and names a field of the consumer's schema. A field the plan owns
-outright (`Always`) cannot be retired and is rejected. The file is read by the planner
-and never generated over.
+outright (`Always`) cannot be retired, so its key is ignored, like a key the schema does
+not name. The file is read by the planner and never generated over.
 """
 
 from __future__ import annotations
@@ -30,20 +30,14 @@ def load_retire(path: Path, schema: RecordSchema[Any, Any]) -> dict[str, RetireE
 
     Each entry holds every retirable field of the schema, in schema order: a list for a
     `Union` field (empty when absent), a scalar for any other (None when absent). A key
-    naming an `Always` field raises `ValueError`; a key the schema does not name is ignored."""
+    naming an `Always` field, or a field the schema does not name, is ignored."""
     if not path.exists():
         return {}
     raw = yaml.safe_load(path.read_text()) or {}
-    always = {f.name for f in schema.fields if isinstance(f.policy, Always)}
     retirable = _retirable(schema)
     out: dict[str, RetireEntry] = {}
     for ext_id, body in raw.items():
         body = body or {}
-        for name in body:
-            if name in always:
-                raise ValueError(
-                    f"{path.name}: {ext_id}: '{name}' cannot be retired (the plan owns it outright)"
-                )
         out[str(ext_id)] = {
             name: (
                 [str(v) for v in body.get(name) or []]

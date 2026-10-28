@@ -74,11 +74,11 @@ class IgnorePrefix:
 
 @dataclass
 class IgnoreList:
+    file: str  # the file name messages cite
     entries: list[IgnoreEntry] = field(default_factory=list)
     prefixes: list[IgnorePrefix] = field(
         default_factory=lambda: [IgnorePrefix(BUILTIN_PREFIX, _BUILTIN_REASON, None)]
     )
-    file: str = ""  # the file name messages cite
 
     def where(self, match: IgnoreEntry | IgnorePrefix) -> str:
         return "built-in" if match.line is None else f"{self.file}:{match.line}"
@@ -155,7 +155,7 @@ def load_ignore(path: Path, fmt: IgnoreFormat) -> IgnoreList:
     `ValueError` on a file that is not the expected shape (`ignore_errors`
     reports the softer problems: missing reason, short prefix, duplicate id)."""
     entries, prefixes = _parse(path, fmt)
-    out = IgnoreList(file=fmt.file)
+    out = IgnoreList(fmt.file)
     for line, item in entries:
         lid = _text(item, fmt.id_key)
         if lid:
