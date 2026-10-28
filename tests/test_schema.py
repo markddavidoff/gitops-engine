@@ -5,7 +5,7 @@ import dataclasses
 import pytest
 from toy import LiveWidget, ToySchema, Widget
 
-from gitops_engine.adapter import SyncMark as AdapterSyncMark
+import gitops_engine
 from gitops_engine.schema import (
     Always,
     FieldSpec,
@@ -97,8 +97,8 @@ def test_nouns_defaults_and_frozen_policies():
     assert FieldSpec("x", KeepIfUnset()).required is False
 
 
-def test_sync_mark_is_shared_with_the_v010_adapter_module():
-    assert AdapterSyncMark is SyncMark
+def test_sync_mark_is_exported_from_the_package():
+    assert gitops_engine.SyncMark is SyncMark
 
 
 def test_toy_keys_reduce_desired_and_live_rows_to_item_keys():

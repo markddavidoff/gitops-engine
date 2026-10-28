@@ -81,7 +81,11 @@ Policy = Always | Union | KeepIfUnset
 @dataclass(frozen=True)
 class FieldSpec:
     """One planned field. A `required` field falls back to the desired value on a
-    destination-owned row whose live value is empty."""
+    destination-owned row whose live value is empty.
+
+    `required` also sets what post-write verification expects of the field when the
+    plan has no change for it: the value from before the write, where any other
+    unplanned field is expected to equal the plan's target (`deploy.apply_deploy`)."""
 
     name: str
     policy: Policy

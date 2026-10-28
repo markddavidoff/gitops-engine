@@ -1,8 +1,8 @@
-"""A toy record schema, plus a walkthrough of the v0.1.0 reconcile lifecycle.
+"""A toy record schema, plus a walkthrough of the reconcile lifecycle.
 
 `Widget` and `LiveWidget` are the smallest records that exercise every field policy;
-`ToySchema` is their `RecordSchema`. The walkthrough at the bottom runs against the
-in-memory `ToyAdapter` and goes away with the v0.1.0 `Adapter`.
+`ToySchema` is their `RecordSchema`. The walkthrough at the bottom mirrors, checks,
+applies and checks again against the in-memory `ToyDestination`.
 
 Run from a clone:  uv run python examples/toy.py
 """
@@ -15,7 +15,7 @@ import re
 from dataclasses import dataclass, field, replace
 from typing import Any
 
-from gitops_engine.identity import IdentitySpec, ItemKeys, MatchKey
+from gitops_engine.identity import Identity, IdentitySpec, ItemKeys, MatchKey
 from gitops_engine.schema import (
     Always,
     FieldSpec,
@@ -176,59 +176,74 @@ class ToySchema:
         return {f.name: row[f.name] for f in self.fields if f.name != "status" or row["status"]}
 
 
-# --- walkthrough (v0.1.0 `Adapter`; removed with it) ---
+# --- walkthrough ---
+
+
+def _implicit(w: Widget, taken: set[str]) -> Identity:
+    """The identity of a desired widget that resolves to none: its first id."""
+    cid = w.ids[0] if w.ids else _norm_name(w.name)
+    return Identity(cid, values={"names": [w.name], "tags": list(w.tags)})
 
 
 def main() -> None:
-    from toy_adapter import ToyAdapter, live_widget, state_row, widget
+    import tempfile
+    from pathlib import Path
 
-    from gitops_engine import EXIT_DRIFT, EXIT_OK, apply, run_check
+    from toy_adapter import ToyDestination
 
-    # The external system already holds one widget; git wants two.
-    adapter = ToyAdapter([live_widget("id1", "gear", "Gear", 1, "v1")])
-    desired = [widget("gear", "Gear", 5), widget("cog", "Cog", 2)]
+    from gitops_engine import EXIT_DRIFT, EXIT_OK, apply_deploy, plan_deploy, run_check
+    from gitops_engine.identity import IdentityTable
+    from gitops_engine.mirror import reconcile_mirror
 
-    # 1. Observe the external system and record a state row (with a SyncMark) per
-    #    live row. Unrecorded live rows would otherwise show up as "added" drift.
-    live = list(adapter.rows.values())
-    state = [state_row(lv) for lv in live]
+    schema, table = ToySchema(), IdentityTable()
+    bound = {"schema": schema, "spec": TOY_IDENTITY_SPEC, "implicit": _implicit}
+
+    # The store already holds one widget; git wants two.
+    store = ToyDestination([LiveWidget("id1", "Gear", "ok", ["gear"], [], 1, "v1")])
+    desired = [
+        Widget("Gear", "ok", ids=["gear"], size=5),
+        Widget("Cog", "ok", ids=["cog"], size=2),
+    ]
+
+    # 1. Mirror the store: one state row (with its SyncMark) per live row. Unrecorded
+    #    live rows would otherwise show up as "added" drift.
+    state = reconcile_mirror(store.list_live(), schema)
 
     # 2. Check: state matches live, so no drift; the plan holds one update, one create.
-    code, drift, plan = run_check(desired, state, live, adapter)
+    res = run_check(desired, state, store.list_live(), table, **bound)
     print(
         "first check:",
-        code,
+        res.code,
         "| creates",
-        [d.ids[0] for d in plan.creates],
+        [d.name for d in res.plan.creates],
         "| updates",
-        [d.ids[0] for d, _ in plan.updates],
+        [d.name for d, _ in res.plan.updates],
     )
-    assert code == EXIT_OK and not plan.aborts
+    assert res.code == EXIT_OK and not res.plan.aborts
 
-    # 3. Apply, then 4. re-record state from the rows apply returned.
-    written = apply(plan, adapter)
-    assert not plan.aborts  # apply appends write-time aborts to the plan
-    state = [state_row(lv) for lv in written]
+    # 3. Apply (snapshot first), then 4. mirror the store again.
+    plan = plan_deploy(desired, store.list_live(), table, **bound, state=state)
+    with tempfile.TemporaryDirectory() as snaps:
+        result = apply_deploy(plan, store, schema=schema, snapshot_dir=Path(snaps))
+    assert result.failure is None and not plan.aborts
+    state = reconcile_mirror(store.list_live(), schema)
 
-    # Re-observe and check again: everything reconciles.
-    live = list(adapter.rows.values())
-    code, drift, plan = run_check(desired, state, live, adapter)
-    print("after apply:", code, "| unchanged", [d.ids[0] for d in plan.unchanged])
-    assert code == EXIT_OK
+    res = run_check(desired, state, store.list_live(), table, **bound)
+    print("after apply:", res.code, "| unchanged", [d.name for d in res.plan.unchanged])
+    assert res.code == EXIT_OK
 
-    # Someone edits "gear" in the external system, out of band.
-    adapter.rows["id1"] = live_widget("id1", "gear", "Gear", 9, "v9")
-    live = list(adapter.rows.values())
-    code, drift, plan = run_check(desired, state, live, adapter)
+    # Someone edits "Gear" in the store, out of band.
+    store.rows["id1"] = replace(store.rows["id1"], size=9, version="v9")
+    res = run_check(desired, state, store.list_live(), table, **bound)
     print(
         "after out-of-band edit:",
-        code,
+        res.code,
         "| changed",
-        [s.ids[0] for s, _ in drift.changed],
+        [s.name for s, _ in res.drift.changed],
         "| aborts",
-        [(d.ids[0], why) for d, _, why in plan.aborts],
+        [(d.name, why) for d, _, why in res.plan.aborts],
     )
-    assert code == EXIT_DRIFT
+    assert res.code == EXIT_DRIFT
 
 
 if __name__ == "__main__":
