@@ -20,8 +20,17 @@ ROOT = Path(__file__).resolve().parents[1]
 REUSABLE = ROOT / ".github" / "workflows" / "sync.yml"
 WRAPPER = "gitops-tool"  # the install step's wrapper around the tool's command
 MODES = ("deploy", "restore", "e2e", "refresh")
-INPUTS = {"mode", "snapshot", "rows", "tool", "command", "config", "token-env", "base_branch"}
-SECRETS = {"destination-token", "destination-readonly-token", "app-id", "app-private-key"}
+INPUTS = {
+    "mode",
+    "snapshot",
+    "rows",
+    "project_dir",
+    "command",
+    "config",
+    "token-env",
+    "base_branch",
+}
+SECRETS = {"DESTINATION_TOKEN", "DESTINATION_READONLY_TOKEN", "APP_ID", "APP_PRIVATE_KEY"}
 CONFIG_KEYS = {
     "data_dir",
     "deploy_environment",
@@ -74,7 +83,8 @@ def test_reusable_workflow_shape():
     for mode in MODES:
         assert mode in inputs["mode"]["description"]
     assert inputs["config"]["default"] == "registry-sync.yaml"
-    for name in ("tool", "command", "token-env"):
+    assert inputs["project_dir"]["default"] == "."
+    for name in ("command", "token-env"):
         assert inputs[name]["required"] is True and "default" not in inputs[name]
     assert set(call["secrets"]) == SECRETS
     assert all(spec["required"] is False for spec in call["secrets"].values())
@@ -123,8 +133,8 @@ def test_reusable_workflow_shape():
     for job in (deploy, refresh):
         token = _step_using(job, "actions/create-github-app-token")
         assert len(token) == 1
-        assert token[0]["with"]["app-id"] == "${{ secrets.app-id }}"
-        assert token[0]["with"]["private-key"] == "${{ secrets.app-private-key }}"
+        assert token[0]["with"]["app-id"] == "${{ secrets.APP_ID }}"
+        assert token[0]["with"]["private-key"] == "${{ secrets.APP_PRIVATE_KEY }}"
         pr_step = next(s for s in job["steps"] if "gh pr create" in s.get("run", ""))
         assert pr_step["env"]["GH_TOKEN"] == "${{ steps.app-token.outputs.token }}"
 
@@ -134,11 +144,11 @@ def test_refresh_uses_the_read_only_token():
     tokens = [
         s["env"]["GITOPS_TOKEN"] for s in refresh["steps"] if "GITOPS_TOKEN" in s.get("env", {})
     ]
-    assert tokens == ["${{ secrets.destination-readonly-token }}"]
+    assert tokens == ["${{ secrets.DESTINATION_READONLY_TOKEN }}"]
 
 
 def test_e2e_tests_the_installed_tool_version():
-    """No ref input and no default repository: e2e fetches the source the tool was installed from."""
+    """No ref input and no default repository: e2e fetches the source the lock installed."""
     deploy = _load()["jobs"]["deploy"]
     fetch = _step_named(deploy, "Fetch the installed tool's tests")
     assert f"{WRAPPER} tool-source" in fetch["run"]
@@ -147,6 +157,15 @@ def test_e2e_tests_the_installed_tool_version():
     assert e2e["working-directory"] == "${{ steps.tool.outputs.dir }}"
     assert e2e["env"]["TESTS"] == "${{ steps.tool.outputs.tests }}"
     assert not _step_using(deploy, "actions/checkout")[1:], "no second checkout of a fixed ref"
+
+
+def test_tool_is_installed_from_the_locked_project():
+    wf = _load()
+    for name, job in wf["jobs"].items():
+        runs = _runs(job)
+        assert "uv sync --locked --project" in runs, name
+        assert "uv run --frozen --project" in runs, name
+        assert "uv tool install" not in runs, name
 
 
 def test_no_ssh_key_step():
@@ -227,7 +246,7 @@ def test_tokens_reach_only_the_steps_that_use_them():
         assert "secrets" not in str(job.get("env", {})), f"{name} puts a secret at job level"
         for step in job["steps"]:
             env = step.get("env", {})
-            if any("secrets.destination" in str(v) for v in env.values()):
+            if any("secrets.DESTINATION" in str(v) for v in env.values()):
                 assert "GITOPS_TOKEN" in env
                 assert set(env) <= {"GITOPS_TOKEN", "MODE", "SNAPSHOT", "ROWS", "TESTS"}
                 assert re.search(
@@ -236,11 +255,17 @@ def test_tokens_reach_only_the_steps_that_use_them():
                 ), step.get("name")
 
 
+def test_secret_names_can_be_environment_secrets():
+    """GitHub secret names are `[A-Z0-9_]`; only such a name lets an environment secret shadow it."""
+    for name in _triggers(_load())["workflow_call"]["secrets"]:
+        assert re.fullmatch(r"[A-Z][A-Z0-9_]*", name), name
+
+
 def test_secrets_are_static_names():
     """Dynamic `secrets[...]` lookups depended on `inherit`; every secret is declared."""
     text = REUSABLE.read_text()
     assert "secrets[" not in text and "vars[" not in text
-    used = set(re.findall(r"secrets\.([a-z-]+)", text))
+    used = set(re.findall(r"secrets\.([A-Z][A-Z0-9_]*)", text))
     assert used == SECRETS
 
 
@@ -333,7 +358,7 @@ def test_plan_rejects_an_unknown_mode(tmp_path):
 
 
 def _stub_uv(tmp_path: Path) -> Path:
-    """A `uv` that records its arguments and names a tool bin dir holding a fake command."""
+    """A `uv` that records its arguments; `uv run [--frozen] [--project P] CMD ...` runs CMD."""
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir(exist_ok=True)
     tool_bin = tmp_path / "tool-bin"
@@ -345,7 +370,12 @@ def _stub_uv(tmp_path: Path) -> Path:
     uv = bin_dir / "uv"
     uv.write_text(
         f'#!/bin/sh\necho "$@" >> "{calls}"\n'
-        f'if [ "$1 $2 $3" = "tool dir --bin" ]; then echo "{tool_bin}"; fi\n'
+        'if [ "$1" = run ]; then\n'
+        "  shift\n"
+        '  if [ "$1" = --frozen ]; then shift; fi\n'
+        '  if [ "$1" = --project ]; then shift 2; fi\n'
+        '  exec "$@"\n'
+        "fi\n"
     )
     uv.chmod(0o755)
     return calls
@@ -353,7 +383,7 @@ def _stub_uv(tmp_path: Path) -> Path:
 
 def _install_env(**over: str) -> dict[str, str]:
     base = {
-        "TOOL": "my-tool @ git+https://example.invalid/owner/my-tool.git@v1",
+        "PROJECT_DIR": "deploy-project",
         "COMMAND": "my-tool",
         "CONFIG": "sync.yaml",
         "TOKEN_ENV": "SECRET_VAR",
@@ -361,25 +391,27 @@ def _install_env(**over: str) -> dict[str, str]:
     return {**base, **over}
 
 
-def test_install_step_installs_the_tool_and_writes_a_wrapper(tmp_path):
+def test_install_step_syncs_the_lock_and_writes_a_wrapper(tmp_path):
     install = _step_named(_load()["jobs"]["plan"], "Install the tool")
     uv_calls = _stub_uv(tmp_path)
     code, _, err = _run_step(install, tmp_path, _install_env())
     assert code == 0, err
-    assert "tool install" in uv_calls.read_text()
-    assert "my-tool @ git+https://example.invalid/owner/my-tool.git@v1" in uv_calls.read_text()
+    assert "sync --locked --project deploy-project" in uv_calls.read_text()
     env_file = (tmp_path / "github_env").read_text()
+    assert "GITOPS_PROJECT=deploy-project" in env_file
     assert "GITOPS_COMMAND=my-tool" in env_file
     assert "GITOPS_CONFIG=sync.yaml" in env_file
     assert "GITOPS_TOKEN_ENV=SECRET_VAR" in env_file
 
-    # The wrapper passes --config, exports the token under the name the tool reads, and
-    # drops the neutral variable before it execs the tool.
+    # The wrapper runs the tool through `uv run --frozen --project`, passes --config, exports
+    # the token under the name the tool reads and drops the neutral variable.
     wrapper = tmp_path / "runner" / "bin" / WRAPPER
-    path_dirs = (tmp_path / "github_path").read_text().split()
     run_env = {
         **os.environ,
-        "PATH": os.pathsep.join([*path_dirs, os.environ["PATH"]]),
+        "PATH": os.pathsep.join(
+            [str(tmp_path / "bin"), str(tmp_path / "tool-bin"), os.environ["PATH"]]
+        ),
+        "GITOPS_PROJECT": "deploy-project",
         "GITOPS_COMMAND": "my-tool",
         "GITOPS_CONFIG": "sync.yaml",
         "GITOPS_TOKEN_ENV": "SECRET_VAR",
@@ -389,6 +421,9 @@ def test_install_step_installs_the_tool_and_writes_a_wrapper(tmp_path):
         [str(wrapper), "check"], env=run_env, capture_output=True, text=True, check=False
     )
     assert proc.returncode == 0, proc.stderr
+    assert "run --frozen --project deploy-project my-tool --config sync.yaml check" in (
+        uv_calls.read_text()
+    )
     assert "args=--config sync.yaml check" in proc.stdout
     assert "token=s3cret" in proc.stdout
 
@@ -402,6 +437,7 @@ def test_install_step_installs_the_tool_and_writes_a_wrapper(tmp_path):
         {"COMMAND": "../evil"},
         {"COMMAND": "a b"},
         {"CONFIG": "one\ntwo"},
+        {"PROJECT_DIR": "one\ntwo"},
     ],
 )
 def test_install_step_rejects_unsafe_inputs(tmp_path, over):
@@ -410,3 +446,64 @@ def test_install_step_rejects_unsafe_inputs(tmp_path, over):
     code, _, err = _run_step(install, tmp_path, _install_env(**over))
     assert code == 2, err
     assert not uv_calls.exists(), "nothing is installed from a rejected input"
+
+
+def _stub_config_tool(tmp_path: Path, answers: dict[str, str], source: str = "dir - /src") -> None:
+    """A `gitops-tool` that answers `config-get KEY` from ``answers`` and `tool-source`."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    cases = "".join(f"    {k}) printf '%s\\n' {shlex.quote(v)} ;;\n" for k, v in answers.items())
+    stub = bin_dir / WRAPPER
+    stub.write_text(
+        "#!/bin/sh\n"
+        'case "$1" in\n'
+        f"  tool-source) echo {shlex.quote(source)} ;;\n"
+        '  config-get) case "$2" in\n'
+        f"{cases}"
+        "    *) exit 2 ;;\n  esac ;;\nesac\n"
+    )
+    stub.chmod(0o755)
+    # macOS realpath has no -m; the step only needs the last argument echoed back.
+    realpath = bin_dir / "realpath"
+    realpath.write_text('#!/bin/sh\nfor a; do last="$a"; done\necho "$last"\n')
+    realpath.chmod(0o755)
+
+
+@pytest.mark.parametrize(
+    "tests",
+    ["../x.py", "a/../../x.py", "foo/..", "a/b/../..", "..", "/abs/x.py", "-k", "--flag=1", "a\nb"],
+)
+def test_e2e_fetch_rejects_unsafe_test_paths(tmp_path, tests):
+    fetch = _step_named(_load()["jobs"]["deploy"], "Fetch the installed tool's tests")
+    _stub_config_tool(tmp_path, {"e2e_tests": tests})
+    code, outputs, err = _run_step(fetch, tmp_path, {})
+    assert code == 2, err
+    assert "e2e_tests" in err
+    assert outputs == {}
+
+
+def test_e2e_fetch_accepts_a_relative_test_path(tmp_path):
+    fetch = _step_named(_load()["jobs"]["deploy"], "Fetch the installed tool's tests")
+    _stub_config_tool(tmp_path, {"e2e_tests": "tests/test_e2e.py"})
+    code, outputs, err = _run_step(fetch, tmp_path, {})
+    assert code == 0, err
+    assert outputs == {"dir": "/src", "tests": "tests/test_e2e.py"}
+
+
+def test_locate_step_refuses_a_multiline_value(tmp_path):
+    locate = _step_named(_load()["jobs"]["deploy"], "Locate the directories")
+    _stub_config_tool(
+        tmp_path, {"data_dir": "data", "state_dir": "state\ninjected=1", "snapshot_dir": "snaps"}
+    )
+    code, outputs, err = _run_step(locate, tmp_path, {"GITHUB_WORKSPACE": str(tmp_path)})
+    assert code == 2, err
+    assert "state_dir must be a single line" in err
+    assert "injected" not in "".join(outputs)
+
+
+def test_locate_step_writes_each_directory(tmp_path):
+    locate = _step_named(_load()["jobs"]["deploy"], "Locate the directories")
+    _stub_config_tool(tmp_path, {"data_dir": "data", "state_dir": "st", "snapshot_dir": "sn"})
+    code, outputs, err = _run_step(locate, tmp_path, {"GITHUB_WORKSPACE": str(tmp_path)})
+    assert code == 0, err
+    assert outputs == {"data_dir": "data", "state_dir": "st", "snapshot_dir": "sn"}
