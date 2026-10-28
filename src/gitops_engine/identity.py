@@ -31,11 +31,14 @@ class MatchKey:
     """One list-valued key an entry can be matched on.
 
     `field` is the key in the file and in `Identity.values`; `label` is the word
-    messages use; `norm` makes two spellings of one value equal."""
+    messages use; `norm` makes two spellings of one value equal. With `skip_empty`,
+    a value that normalises to "" matches nothing and is never reported as a
+    duplicate; without it, the empty string is a value like any other."""
 
     field: str
     label: str
     norm: Callable[[str], str]
+    skip_empty: bool = False
 
 
 @dataclass(frozen=True)
@@ -193,7 +196,7 @@ def _hits(item: ItemKeys, table: IdentityTable, spec: IdentitySpec) -> list[Hit]
     for mk in spec.match_keys:
         for v in offered.get(mk.field, ()):
             nv = mk.norm(v)
-            if not nv:
+            if mk.skip_empty and not nv:
                 continue
             out.extend(
                 Hit(i.canonical_id, mk.label, v)
@@ -259,7 +262,7 @@ def table_errors(table: IdentityTable, spec: IdentitySpec) -> list[str]:
                 (mk.norm(v), v, i.canonical_id)
                 for i in ents
                 for v in i.values.get(mk.field, ())
-                if mk.norm(v)
+                if not mk.skip_empty or mk.norm(v)
             ],
         )
     for src in spec.sources:

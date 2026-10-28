@@ -131,10 +131,33 @@ def test_match_key_normalisers_apply(tmp_path):
     )
 
 
-def test_empty_normalised_value_matches_nothing(tmp_path):
-    t = table(tmp_path, a={"names": ["A"]})
-    t.entries["a"].values["names"].append("--")  # normalises to ""
-    assert resolve(item(values={"names": ["!!"]}), t, SPEC) is None
+def _loose_spec(*, skip_empty: bool) -> IdentitySpec:
+    """A spec whose `tags` key normalises punctuation away, so "--" becomes ""."""
+    strip = lambda v: "".join(c for c in v.lower() if c.isalnum())
+    return IdentitySpec(
+        sources=("s1",),
+        match_keys=(MatchKey("tags", "tag", strip, skip_empty=skip_empty),),
+        destination_source="s1",
+        file_order=("tags", "sources"),
+    )
+
+
+def test_skip_empty_true_matches_and_reports_nothing_for_empty_values():
+    spec = _loose_spec(skip_empty=True)
+    t = parse_identities({"a": {"tags": ["--"]}, "b": {"tags": ["!!"]}}, "f.yaml", spec)
+    assert resolve(item(values={"tags": ["??"]}), t, spec) is None
+    assert table_errors(t, spec) == []
+
+
+def test_skip_empty_false_treats_the_empty_value_as_a_value():
+    spec = _loose_spec(skip_empty=False)
+    t = parse_identities({"a": {"tags": ["--"]}, "b": {"tags": ["!!"]}}, "f.yaml", spec)
+    assert got(resolve(item(values={"tags": ["??"]}), t, spec)) == ("a", "tag", "??")
+    assert table_errors(t, spec) == ["tag '--' is on two identities: a, b"]
+
+
+def test_skip_empty_defaults_to_false():
+    assert MatchKey("tags", "tag", str.lower).skip_empty is False
 
 
 def test_unknown_item_value_field_is_ignored(tmp_path):

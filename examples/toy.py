@@ -82,7 +82,10 @@ def _norm_name(name: str) -> str:
 # Resolution order: canonical id, then source `s1`, then `s2`, then tags, then names.
 TOY_IDENTITY_SPEC = IdentitySpec(
     sources=("s1", "s2"),
-    match_keys=(MatchKey("tags", "tag", str.lower), MatchKey("names", "name", _norm_name)),
+    match_keys=(
+        MatchKey("tags", "tag", str.lower),
+        MatchKey("names", "name", _norm_name, skip_empty=True),
+    ),
     destination_source="s2",
     file_order=("names", "tags", "sources"),
 )
