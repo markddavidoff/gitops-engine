@@ -53,7 +53,8 @@ def test_live_hash_ignores_version_and_id_but_not_content():
 
 def test_toy_fields_and_nouns():
     schema = ToySchema()
-    assert schema.nouns == Nouns("widget", "widgets", "store")
+    assert schema.nouns == Nouns("widget", "widgets", "store", source="git")
+    assert Nouns().source == "source"
     by_name = {f.name: f for f in schema.fields}
     assert [f.name for f in schema.fields] == ["name", "status", "ids", "tags", "size"]
     assert by_name["name"].policy == Always()

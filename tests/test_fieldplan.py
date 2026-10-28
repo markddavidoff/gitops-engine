@@ -284,7 +284,7 @@ def test_stale_retire_unknown_id_and_absent_value():
     }
     desired = [want(), want(name="Nolive", ids=["nolive"])]
     assert stale(desired, [live(tags=["b.io"], size=300)], retire) == [
-        "ghost: no registry row",
+        "ghost: no git row",
         "nolive: no live match",
         "gear: tags gone.io not live",
         "gear: size 7 not live",
@@ -300,13 +300,13 @@ def test_stale_retire_clean_entry_is_silent():
 def test_stale_retire_conflicts_with_desired():
     retire = {"gear": {"tags": ["A.com"], "size": 5}}
     assert stale([want(tags=["a.com"], size=5)], [live(tags=["a.com"], size=5)], retire) == [
-        "gear: tags A.com conflicts with registry",
-        "gear: size 5 conflicts with registry",
+        "gear: tags A.com conflicts with git",
+        "gear: size 5 conflicts with git",
     ]
     # desired owns the field whenever it sets one, even a different value
     retire = {"gear": {"size": 300}}
     assert stale([want(size=250)], [live(size=300)], retire) == [
-        "gear: size 300 conflicts with registry"
+        "gear: size 300 conflicts with git"
     ]
 
 

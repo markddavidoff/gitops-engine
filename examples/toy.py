@@ -94,7 +94,7 @@ TOY_IDENTITY_SPEC = IdentitySpec(
 class ToySchema:
     """`RecordSchema[Widget, LiveWidget]`."""
 
-    nouns = Nouns("widget", "widgets", "store")
+    nouns = Nouns("widget", "widgets", "store", source="git")
     fields = (
         FieldSpec("name", Always()),
         FieldSpec("status", Always(), required=True),

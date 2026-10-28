@@ -248,12 +248,12 @@ def stale_retire[D, L](
     by_xid = {
         _canonical_id(d, schema): d for d in desired if schema.desired_value(d, schema.id_field)
     }
-    destination = schema.nouns.destination
+    destination, source = schema.nouns.destination, schema.nouns.source
     msgs: list[str] = []
     for xid, entry in retire.items():
         d = by_xid.get(xid)
         if d is None:
-            msgs.append(f"{xid}: no registry row")
+            msgs.append(f"{xid}: no {source} row")
             continue
         if schema.destination_owned(d):
             msgs.append(f"{xid}: {destination}-owned stub (retire does not apply)")
@@ -273,7 +273,7 @@ def stale_retire[D, L](
                     if key(v) not in live_keys:
                         msgs.append(f"{xid}: {f.name} {v} not live")
                     if key(v) in want_keys:
-                        msgs.append(f"{xid}: {f.name} {v} conflicts with registry")
+                        msgs.append(f"{xid}: {f.name} {v} conflicts with {source}")
             elif isinstance(f.policy, KeepIfUnset):
                 retired = entry.get(f.name)
                 if retired is None:
@@ -281,5 +281,5 @@ def stale_retire[D, L](
                 if retired != have:
                     msgs.append(f"{xid}: {f.name} {retired} not live")
                 if want is not None:
-                    msgs.append(f"{xid}: {f.name} {retired} conflicts with registry")
+                    msgs.append(f"{xid}: {f.name} {retired} conflicts with {source}")
     return msgs

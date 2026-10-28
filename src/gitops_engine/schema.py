@@ -35,11 +35,13 @@ class SyncMark:
 
 @dataclass(frozen=True)
 class Nouns:
-    """The words the engine prints for the consumer's records and their destination."""
+    """The words the engine prints for the consumer's records, their destination, and
+    the source the desired rows come from."""
 
     record: str = "record"
     records: str = "records"
     destination: str = "destination"
+    source: str = "source"
 
 
 @dataclass(frozen=True)
