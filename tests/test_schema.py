@@ -98,3 +98,16 @@ def test_nouns_defaults_and_frozen_policies():
 
 def test_sync_mark_is_shared_with_the_v010_adapter_module():
     assert AdapterSyncMark is SyncMark
+
+
+def test_toy_keys_reduce_desired_and_live_rows_to_item_keys():
+    from gitops_engine.identity import ItemKeys
+
+    schema = ToySchema()
+    want = Widget(name="Gear", status="active", ids=["g-1"], tags=["a", "b"])
+    assert schema.desired_keys(want) == ItemKeys(
+        label="Gear", ids=("g-1",), values=(("tags", ("a", "b")),)
+    )
+    assert schema.live_keys(_live()) == ItemKeys(
+        label="Gear", ids=("g-1",), values=(("tags", ("a", "b")),)
+    )

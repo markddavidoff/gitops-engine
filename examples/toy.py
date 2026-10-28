@@ -11,9 +11,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass, field, replace
 from typing import Any
 
+from gitops_engine.identity import IdentitySpec, ItemKeys, MatchKey
 from gitops_engine.schema import (
     Always,
     FieldSpec,
@@ -73,6 +75,19 @@ def _hash(name: str, status: str, ids: list[str], tags: list[str], size: int | N
     return hashlib.sha256(blob.encode()).hexdigest()
 
 
+def _norm_name(name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", name.lower())
+
+
+# Resolution order: canonical id, then source `s1`, then `s2`, then tags, then names.
+TOY_IDENTITY_SPEC = IdentitySpec(
+    sources=("s1", "s2"),
+    match_keys=(MatchKey("tags", "tag", str.lower), MatchKey("names", "name", _norm_name)),
+    destination_source="s2",
+    file_order=("names", "tags", "sources"),
+)
+
+
 class ToySchema:
     """`RecordSchema[Widget, LiveWidget]`."""
 
@@ -106,15 +121,10 @@ class ToySchema:
     def live_version(self, lv: LiveWidget) -> str:
         return lv.version
 
-    def desired_keys(self, d: Widget):
-        # `ItemKeys` lands with `gitops_engine.identity` (Task 3).
-        from gitops_engine.identity import ItemKeys
-
+    def desired_keys(self, d: Widget) -> ItemKeys:
         return ItemKeys(label=d.name, ids=tuple(d.ids), values=(("tags", tuple(d.tags)),))
 
-    def live_keys(self, lv: LiveWidget):
-        from gitops_engine.identity import ItemKeys
-
+    def live_keys(self, lv: LiveWidget) -> ItemKeys:
         return ItemKeys(label=lv.name, ids=tuple(lv.ids), values=(("tags", tuple(lv.tags)),))
 
     def mark(self, d: Widget) -> SyncMark | None:
