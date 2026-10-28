@@ -46,9 +46,10 @@ to Linear Customers. Reading it is not required to work on this repo.
 
 ## Planned engine features
 
-- [ ] **Absorb.** `run_check` reports untracked values and exits 3 until they are
-  recorded. An *absorb* step would write those values into a curated input file in git
-  so nobody hand-edits generated files. Today a person records them by hand.
+- [ ] **Absorb.** `run_check` reports untracked values and passes; they do not change
+  the exit code. An *absorb* step would write those values into a curated input file in
+  git so the dataset matches the destination and nobody hand-edits generated files.
+  Today a person records them by hand.
 
 ## Library work
 
