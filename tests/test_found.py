@@ -80,6 +80,8 @@ def test_found_skips_identity_with_primary_record(tmp_path):
     # The row still teaches the identity what it knows.
     assert store.table.entries["gear"].sources == {SRC: "gear-file", DEST: "L1"}
     assert store.table.entries["gear"].values["tags"] == ["red", "blue"]
+    # An existing identity learns only `learned_values`: the row's name is not appended.
+    assert "Gear" not in store.table.entries["gear"].values.get("names", [])
 
 
 def test_found_ambiguous_records_nothing(tmp_path):
