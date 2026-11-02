@@ -19,13 +19,19 @@ Each entry may hold:
 `load_overrides` raises `ValueError` on a file it cannot read as this shape;
 `override_errors` reports that and every softer problem without raising.
 `OverridesStore` edits the file with ruamel's round trip, keeping comments.
+
+`apply_overrides` turns upstream desired rows into the rows a deploy writes;
+`check_overrides` reports what a check fails on or prints about the entries against
+those upstream rows; `held_rows` names the rows a deploy must not write while a
+decision is pending; `adopt_entry` and `OverridesStore.adopt` record live values the
+desired rows would otherwise clear as accepted overrides.
 """
 
 from __future__ import annotations
 
 import datetime
 import os
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from io import StringIO
 from pathlib import Path
@@ -36,9 +42,10 @@ from ruamel.yaml.comments import CommentedMap, CommentedSeq
 from ruamel.yaml.representer import RoundTripRepresenter
 from ruamel.yaml.scalarstring import DoubleQuotedScalarString
 
-from .identity import load_text
+from .destination import is_empty
+from .identity import IdentityTable, load_text
 from .ignore import BUILTIN_PREFIX, BUILTIN_REASON, round_trip_yaml
-from .schema import RecordSchema, clears
+from .schema import Always, FieldSpec, RecordSchema, Union, clears
 
 PENDING_ADD = "_add"
 PREFIXES_KEY = "hidden_name_prefixes"
@@ -353,6 +360,191 @@ def override_errors(path: Path, fmt: OverridesFormat, schema: RecordSchema) -> l
     return walk.shape + walk.problems
 
 
+# --- applying --------------------------------------------------------------------
+
+
+def _canonical_id(d: Any, schema: RecordSchema[Any, Any]) -> str:
+    ids = schema.desired_value(d, schema.id_field)
+    return ids[0] if ids else ""
+
+
+def _spec(schema: RecordSchema[Any, Any], name: str) -> FieldSpec | None:
+    return next((f for f in schema.fields if f.name == name), None)
+
+
+def _is_list(f: FieldSpec) -> bool:
+    return isinstance(f.policy, Union) or (isinstance(f.policy, Always) and f.policy.unordered)
+
+
+def _list_key(schema: RecordSchema[Any, Any], name: str) -> Callable[[str], str]:
+    """How a list field's values compare: a `Union` field's key, else exact."""
+    spec = _spec(schema, name)
+    if spec is not None and isinstance(spec.policy, Union):
+        return spec.policy.key
+    return str
+
+
+def _gone(entry: OverrideEntry) -> bool:
+    return entry.hidden is not None or entry.deleted is not None
+
+
+def apply_overrides[D](
+    rows: list[D],
+    ov: Overrides,
+    *,
+    schema: RecordSchema[D, Any],
+    pin: Callable[[D, dict[str, Any]], D] | None = None,
+) -> list[D]:
+    """The rows with their overrides applied, in order.
+
+    A `hidden` or `deleted` row is dropped. A destination-owned row is otherwise left
+    as it is. Every pin goes through one `pin(row, pins)` call (default
+    `schema.with_values`). Each list field then gains its `add` values not already
+    present and loses its `remove` values, both compared by the field's key. `pending`
+    is never applied."""
+    pin = pin or schema.with_values
+    out: list[D] = []
+    for d in rows:
+        entry = ov.entries.get(_canonical_id(d, schema))
+        if entry is None:
+            out.append(d)
+            continue
+        if _gone(entry):
+            continue
+        if schema.destination_owned(d):
+            out.append(d)
+            continue
+        if entry.pin:
+            d = pin(d, dict(entry.pin))
+        lists: dict[str, list[Any]] = {}
+        for name in dict.fromkeys([*entry.add, *entry.remove]):
+            key = _list_key(schema, name)
+            values = list(schema.desired_value(d, name) or [])
+            have = {key(v) for v in values}
+            for v in entry.add.get(name, []):
+                if key(v) not in have:
+                    values.append(v)
+                    have.add(key(v))
+            drop = {key(v) for v in entry.remove.get(name, [])}
+            lists[name] = [v for v in values if key(v) not in drop]
+        if lists:
+            d = schema.with_values(d, lists)
+        out.append(d)
+    return out
+
+
+def held_rows(ov: Overrides) -> dict[str, str]:
+    """Canonical id -> why a deploy must not write the row: a pending decision."""
+    return {cid: f"pending decision in {ov.file}" for cid, e in ov.entries.items() if e.pending}
+
+
+# --- checking --------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Pending:
+    """One pending value. `field` is a scalar field or `<list field>_add`."""
+
+    canonical_id: str
+    field: str
+    value: Any
+
+
+@dataclass
+class OverrideFindings:
+    failures: list[str]
+    reports: list[str]
+    pending: list[Pending]  # each a failure the caller renders
+
+
+def check_overrides[D](
+    ov: Overrides,
+    upstream: list[D],
+    table: IdentityTable,
+    *,
+    schema: RecordSchema[D, Any],
+    pin: Callable[[D, dict[str, Any]], D] | None = None,
+) -> OverrideFindings:
+    """The entries checked against the upstream rows (before overrides) and the identity
+    table. `pin` is the callback `apply_overrides` uses; a pin is redundant when it
+    alone leaves the field's desired value unchanged."""
+    pin = pin or schema.with_values
+    nouns = schema.nouns
+    by_cid: dict[str, D] = {}
+    for d in upstream:
+        by_cid.setdefault(_canonical_id(d, schema), d)
+    found = OverrideFindings([], [], [])
+    for cid, e in ov.entries.items():
+        found.pending += [Pending(cid, name, value) for name, value in e.pending.items()]
+        d = by_cid.get(cid)
+        if d is None and cid not in table.entries:
+            found.failures.append(f"{cid}: no identity")
+            continue
+        if e.deleted is not None:
+            found.reports.append(
+                f"{cid}: deleted at {nouns.destination} "
+                f"({e.deleted.live_id}, {e.deleted.confirmed}): not recreated"
+            )
+        if d is not None and schema.destination_owned(d):
+            what = [
+                *(["pin"] if e.pin else []),
+                *(["pending"] if e.pending else []),
+                *(f"{name}.add" for name in e.add),
+                *(f"{name}.remove" for name in e.remove),
+            ]
+            found.failures += [
+                f"{cid}: {w} does not apply to a {nouns.destination}-owned stub" for w in what
+            ]
+            continue
+        for name, values in e.remove.items():
+            key = _list_key(schema, name)
+            upstream_values = schema.desired_value(d, name) if d is not None else None
+            carried = {key(v) for v in upstream_values or []}
+            found.failures += [
+                f"{cid}: {name}.remove {v}: upstream does not carry it"
+                for v in values
+                if key(v) not in carried
+            ]
+        if d is not None:
+            for name, value in e.pin.items():
+                if schema.desired_value(pin(d, {name: value}), name) == schema.desired_value(
+                    d, name
+                ):
+                    found.reports.append(f"{cid}: pin {name} equals upstream (redundant)")
+    return found
+
+
+# --- adopting --------------------------------------------------------------------
+
+
+def adopt_entry[D, L](d: D, lv: L, *, schema: RecordSchema[D, L]) -> OverrideEntry | None:
+    """The overrides that keep `lv`'s values a deploy of `d` would otherwise clear: a
+    pin of the live value for each clearing scalar field `d` leaves empty, and an `add`
+    of each live value of a clearing list field `d` lacks (by the field's key). None
+    when there is nothing to keep."""
+    pins: dict[str, Any] = {}
+    adds: dict[str, list[str]] = {}
+    for f in schema.fields:
+        if not clears(f.policy):
+            continue
+        want, have = schema.desired_value(d, f.name), schema.live_value(lv, f.name)
+        if _is_list(f):
+            key = _list_key(schema, f.name)
+            seen = {key(v) for v in want or []}
+            missing: list[str] = []
+            for v in have or []:
+                if key(v) not in seen:
+                    missing.append(v)
+                    seen.add(key(v))
+            if missing:
+                adds[f.name] = missing
+        elif is_empty(want) and not is_empty(have):
+            pins[f.name] = have
+    if not pins and not adds:
+        return None
+    return OverrideEntry(pin=pins, add=adds)
+
+
 # --- writing -------------------------------------------------------------------
 
 
@@ -569,6 +761,19 @@ class OverridesStore:
             return False
         self._entry(cid)["deleted"] = _flow_map(**{self.fmt.live_id_key: live_id, "confirmed": day})
         return self._changed()
+
+    def adopt(self, cid: str, entry: OverrideEntry) -> bool:
+        """Merge `entry`'s pins and adds into `cid`'s entry. An existing pin, even an
+        empty one, is kept."""
+        current = self.overrides.entries.get(cid)
+        pinned = current.pin if current is not None else {}
+        changed = False
+        for name, value in entry.pin.items():
+            if name not in pinned:
+                changed = self.pin(cid, name, value) or changed
+        for name, values in entry.add.items():
+            changed = self.add_values(cid, name, values) or changed
+        return changed
 
     def add_hidden_prefix(self, prefix: str, reason: str) -> bool:
         prefix, reason = prefix.strip(), reason.strip()

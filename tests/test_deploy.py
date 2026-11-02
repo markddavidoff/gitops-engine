@@ -161,3 +161,19 @@ def test_withholding_with_clears():
     assert p.unacked == []
     [line] = p.withheld
     assert "'x'" in line and "'Cog'" in line
+
+
+def test_held_row_aborts():
+    reason = "pending decision in toy-overrides.yaml"
+    desired = [
+        want(size=5, ids=("w1",)),
+        want("Cog", size=6, ids=("w2",)),
+        want("New", ids=("w3",)),
+    ]
+    live_rows = [live(size=1, ids=("w1",)), live("Cog", live_id="L2", size=1, ids=("w2",))]
+    p = plan(desired, live_rows, held={"w1": reason})
+    [(d, lv, why)] = p.aborts
+    assert (d.ids, lv.live_id, why) == (["w1"], "L1", reason)
+    assert [(t.ids, lv.live_id) for t, lv in p.updates] == [(["w2"], "L2")]
+    assert [d.name for d in p.creates] == ["New"]
+    assert "L1" not in p.changes

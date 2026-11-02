@@ -26,7 +26,7 @@ generated output).
 
 from __future__ import annotations
 
-from collections.abc import Callable, Collection
+from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -239,6 +239,7 @@ def run_check[D, L, R](
     entries: list[DatasetRecord[R]] | None = None,
     hooks: DatasetHooks[R] | None = None,
     other_live: list[L] | None = None,
+    held: Mapping[str, str] | None = None,
 ) -> CheckResult[D, L]:
     """Drift, the plan and every live check, as one `CheckResult`.
 
@@ -247,7 +248,7 @@ def run_check[D, L, R](
     the check also fails orphans and reports unused identities and records with no
     identity. `entries=None` skips those checks. `hooks` is required with `entries`.
     `other_live` are further live rows outside this run (a scoped run's out-of-scope
-    rows) whose exclusive values still count as held."""
+    rows) whose exclusive values still count as held. `held` passes to `plan_deploy`."""
     if entries is not None and hooks is None:
         raise ValueError("run_check: entries need hooks to read them")
     ignore = ignore if ignore is not None else IgnoreList("")
@@ -269,6 +270,7 @@ def run_check[D, L, R](
         state=state,
         retire=retire,
         other_live=[*ignored, *(other_live or [])],
+        held=held,
     )
     untracked = untracked_values(desired, managed, table, retire, **bound)
     stale = stale_retire(desired, managed, table, retire, **bound)

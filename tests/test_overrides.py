@@ -6,14 +6,22 @@ from pathlib import Path
 
 import pytest
 from toy import TOY_OVERRIDES as FMT
-from toy import OwnedToySchema, ToySchema
+from toy import LiveWidget, OwnedToySchema, ToySchema, Widget
 
+from gitops_engine.identity import Identity, IdentityTable
 from gitops_engine.ignore import BUILTIN_PREFIX, BUILTIN_REASON
 from gitops_engine.overrides import (
     Deleted,
     HiddenPrefix,
     OverrideEntry,
+    OverrideFindings,
+    Overrides,
     OverridesStore,
+    Pending,
+    adopt_entry,
+    apply_overrides,
+    check_overrides,
+    held_rows,
     load_overrides,
     override_errors,
 )
@@ -219,3 +227,140 @@ def test_store_rejects_unknown_fields(tmp_path: Path) -> None:
         store.add_values("w1", "name", ["a"])
     with pytest.raises(ValueError, match="reason"):
         store.hide("w1", " ")
+
+
+# --- applying, checking, holding and adopting ---------------------------------------
+
+
+def widget(cid="w1", *, name="Gear", status="ok", tags=(), size=None, owned=False) -> Widget:
+    return Widget(name=name, status=status, ids=[cid], tags=list(tags), size=size, owned=owned)
+
+
+def live_widget(*, name="Gear", status="ok", tags=(), size=None) -> LiveWidget:
+    return LiveWidget("L1", name, status, ["w1"], list(tags), size, "v1")
+
+
+def ov(**entries: OverrideEntry) -> Overrides:
+    return Overrides(FMT.file, entries=dict(entries))
+
+
+def test_apply_pins_and_lists() -> None:
+    rows = [widget(tags=["o", "p"]), widget("w2", tags=["o"])]
+    entry = OverrideEntry(pin={"size": 7}, add={"tags": ["n"]}, remove={"tags": ["O"]})
+    out = apply_overrides(rows, ov(w1=entry), schema=ToySchema())
+    assert (out[0].size, out[0].tags) == (7, ["p", "n"])
+    assert out[1] == rows[1]  # no entry: untouched
+
+
+def test_apply_add_dedupes_by_policy_key() -> None:
+    entry = OverrideEntry(add={"tags": ["A", "n", "N"]})
+    [out] = apply_overrides([widget(tags=["a"])], ov(w1=entry), schema=ToySchema())
+    assert out.tags == ["a", "n"]
+
+
+def test_apply_hidden_and_deleted_drop_row() -> None:
+    rows = [widget("w1"), widget("w2"), widget("w3")]
+    entries = ov(w1=OverrideEntry(hidden="test"), w2=OverrideEntry(deleted=Deleted("L2", "x")))
+    out = apply_overrides(rows, entries, schema=ToySchema())
+    assert [w.ids for w in out] == [["w3"]]
+
+
+def test_apply_skips_stub_except_hidden() -> None:
+    stub = widget(size=3, tags=["a"], owned=True)
+    entry = OverrideEntry(pin={"size": 7}, add={"tags": ["n"]}, remove={"tags": ["a"]})
+    assert apply_overrides([stub], ov(w1=entry), schema=ToySchema()) == [stub]
+    assert apply_overrides([stub], ov(w1=OverrideEntry(hidden="x")), schema=ToySchema()) == []
+
+
+def test_pending_is_not_applied() -> None:
+    row = widget(size=3, tags=["a"])
+    entry = OverrideEntry(pending={"size": 9, "tags_add": ["b"]})
+    assert apply_overrides([row], ov(w1=entry), schema=ToySchema()) == [row]
+
+
+def test_apply_uses_pin_callback() -> None:
+    calls: list[dict] = []
+
+    def pin(d: Widget, values: dict) -> Widget:
+        calls.append(dict(values))
+        return ToySchema().with_values(d, {k: f"{v}!" for k, v in values.items()})
+
+    entry = OverrideEntry(pin={"name": "N", "status": "S"})
+    [out] = apply_overrides([widget()], ov(w1=entry), schema=ToySchema(), pin=pin)
+    assert calls == [{"name": "N", "status": "S"}]
+    assert (out.name, out.status) == ("N!", "S!")
+
+
+def test_held_rows() -> None:
+    entries = ov(w1=OverrideEntry(pending={"size": 9}), w2=OverrideEntry(pin={"size": 1}))
+    assert held_rows(entries) == {"w1": f"pending decision in {FMT.file}"}
+
+
+def test_check_overrides_failures_and_reports() -> None:
+    table = IdentityTable({"w3": Identity("w3", values={}, sources={})})
+    upstream = [widget(tags=["a"]), widget("w2", owned=True)]
+    entries = ov(
+        w1=OverrideEntry(
+            pin={"status": "ok", "size": 7},
+            remove={"tags": ["A", "zz"]},
+            pending={"size": 9},
+        ),
+        w2=OverrideEntry(
+            pin={"size": 1},
+            pending={"size": 2},
+            add={"tags": ["n"]},
+            remove={"tags": ["m"]},
+            hidden="allowed on a stub",
+        ),
+        w3=OverrideEntry(deleted=Deleted("L3", "2026-10-28")),
+        ghost=OverrideEntry(pin={"size": 1}),
+    )
+    found = check_overrides(entries, upstream, table, schema=ToySchema())
+    assert isinstance(found, OverrideFindings)
+    assert found.failures == [
+        "w1: tags.remove zz: upstream does not carry it",
+        "w2: pin does not apply to a store-owned stub",
+        "w2: pending does not apply to a store-owned stub",
+        "w2: tags.add does not apply to a store-owned stub",
+        "w2: tags.remove does not apply to a store-owned stub",
+        "ghost: no identity",
+    ]
+    assert found.reports == [
+        "w1: pin status equals upstream (redundant)",
+        "w3: deleted at store (L3, 2026-10-28): not recreated",
+    ]
+    assert found.pending == [Pending("w1", "size", 9), Pending("w2", "size", 2)]
+
+
+def test_check_overrides_redundant_pin_uses_pin_callback() -> None:
+    def pin(d: Widget, values: dict) -> Widget:
+        return ToySchema().with_values(d, {k: f"{v} [x]" for k, v in values.items()})
+
+    entries = ov(w1=OverrideEntry(pin={"name": "Gear"}))
+    upstream = [widget(name="Gear [x]")]
+    found = check_overrides(entries, upstream, IdentityTable(), schema=ToySchema(), pin=pin)
+    assert found.reports == ["w1: pin name equals upstream (redundant)"]
+    assert not found.failures and not found.pending
+
+
+def test_adopt_entry() -> None:
+    schema = OwnedToySchema()
+    entry = adopt_entry(
+        widget(size=None, tags=["a"]), live_widget(size=5, tags=["a", "B"]), schema=schema
+    )
+    assert entry is not None
+    assert entry.pin == {"size": 5}
+    assert entry.add == {"tags": ["B"]}
+    same = adopt_entry(widget(size=5, tags=["A"]), live_widget(size=5, tags=["a"]), schema=schema)
+    assert same is None
+
+
+def test_store_adopt_keeps_existing_pin(tmp_path: Path) -> None:
+    store = OverridesStore(tmp_path / FMT.file, FMT)
+    store.pin("w1", "size", None)
+    entry = OverrideEntry(pin={"size": 5, "status": "S"}, add={"tags": ["B"]})
+    assert store.adopt("w1", entry)
+    assert not store.adopt("w1", entry)
+    got = store.overrides.entries["w1"]
+    assert got.pin == {"size": None, "status": "S"}
+    assert got.add == {"tags": ["B"]}

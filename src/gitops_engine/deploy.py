@@ -12,7 +12,7 @@ never deleted.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -112,6 +112,7 @@ def plan_deploy[D, L](
     state: list[D] | None = None,
     retire: dict[str, RetireEntry] | None = None,
     other_live: list[L] | None = None,
+    held: Mapping[str, str] | None = None,
 ) -> DeployPlan[D, L]:
     """Diff desired against live, paired by identity.
 
@@ -122,7 +123,9 @@ def plan_deploy[D, L](
 
     `updates` holds `(target, live)`, where target is the effective row to write.
     `retire` is keyed by the desired row's first id. `other_live` are live rows the
-    plan never writes whose exclusive values still count as held."""
+    plan never writes whose exclusive values still count as held. `held` maps a
+    canonical id to why its paired row must not be written (a pending decision): the
+    row goes to `aborts` with that reason."""
     nouns = schema.nouns
     plan: DeployPlan[D, L] = DeployPlan()
     state_by_id: dict[str, D] = {}
@@ -153,6 +156,9 @@ def plan_deploy[D, L](
             plan.creates.append(_withhold_shared(d, None, holders, plan, schema))
             continue
         ids = schema.desired_value(d, schema.id_field) or []
+        if held and ids and ids[0] in held:
+            plan.aborts.append((d, lv, held[ids[0]]))
+            continue
         st = next((state_by_id[x] for x in ids if x in state_by_id), None)
         if st is None:
             st = state_by_live.get(schema.live_id(lv))
