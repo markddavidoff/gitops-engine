@@ -26,11 +26,12 @@ URL, pinned to a tag:
 
 ```toml
 # pyproject.toml
-dependencies = ["gitops-engine @ git+https://github.com/markddavidoff/gitops-engine@v0.2.0"]
+dependencies = ["gitops-engine @ git+https://github.com/markddavidoff/gitops-engine@v0.3.0"]
 ```
 
-v0.2.0 replaces the v0.1 `Adapter` / `make_plan` / `apply` / `run_check` API. There is
-no compatibility layer.
+v0.2.0 replaced the v0.1 `Adapter` / `make_plan` / `apply` / `run_check` API, with no
+compatibility layer. v0.3.0 only adds to v0.2.0: every new parameter and policy setting
+defaults to the v0.2.0 behavior, so a consumer that passes none of them runs as before.
 
 ## Run the example
 
@@ -85,9 +86,26 @@ Each `FieldSpec` carries one policy:
 
 | Policy | Applies to | Rule |
 |---|---|---|
-| `Always(unordered=False)` | scalars and lists | Desired replaces live. With `unordered`, values compare sorted and every difference is a plain change. |
-| `Union(key, exclusive, item)` | lists | The written value is the desired values plus values that exist only on the destination. Destination-only values are kept and reported as untracked. A destination-only value is dropped only when a retire entry names it. `key` normalises values before comparing (lower case by default), so a spelling that differs only by case plans no change and keeps the live spelling. With `exclusive`, a value another live record already holds is withheld, not written. |
+| `Always(unordered=False, clears=False)` | scalars and lists | Desired replaces live. With `unordered`, values compare sorted and every difference is a plain change. With `clears`, an empty desired value clears a live value (see below). |
+| `Union(key, exclusive, item, clears=False)` | lists | The written value is the desired values plus values that exist only on the destination. Destination-only values are kept and reported as untracked. A destination-only value is dropped only when a retire entry names it. `key` normalises values before comparing (lower case by default), so a spelling that differs only by case plans no change and keeps the live spelling. With `exclusive`, a value another live record already holds is withheld, not written. With `clears`, the plan owns the list (see below). |
 | `KeepIfUnset` | scalars | When the desired row sets the field, desired wins. When it leaves the field unset, the live value is kept and reported as untracked. |
+
+**`clears`.** A field whose policy sets `clears` is owned outright, empty values
+included:
+
+- An `Always` scalar with an empty desired value clears a live value that is not empty.
+- A `Union` list writes the desired values only. Each keeps its live spelling, and every
+  live value whose key the desired list lacks is removed. `exclusive` still withholds a
+  value another live record holds.
+- Retire entries do not apply to the field, because the plan already writes every
+  removal. The plan marks each clear and removal as acknowledged, so apply does not
+  refuse it for missing a retire entry.
+- A `required` field cannot clear: declaring both raises `ValueError`.
+
+A schema in which no field clears keeps the v0.2.0 never-null guard. Once some field
+clears, apply lets a clear or removal empty only the fields that clear (and the
+`KeepIfUnset` and `Union` fields a retire entry may still empty). It refuses an empty
+write to any other field.
 
 `FieldSpec.required` has two effects:
 
@@ -134,10 +152,102 @@ Every file name is a parameter.
 | Identity table | `identity`, `identity_store` | The table, a comment-preserving appender, ordered-key `resolve`, conflict and integrity checks. |
 | Merge | `merge` | One record per identity. The earliest dataset in priority order wins whole; extra keys gather onto the winner. |
 | Destination-only stubs | `found` | Resolve each managed live row, mint identities for unmatched ones, emit stub records. |
-| Ignore list | `ignore` | Match live rows by id or name prefix; a built-in test prefix applies to unscoped runs. |
-| Retire file | `retire` | Per record, the values to remove, each with its exact current value. The only way a value is ever removed; an entry whose value is already gone is reported stale. |
+| Overrides | `overrides` | One file of curated decisions that differ from the source, keyed by canonical id: pins, list additions and removals, pending edits, hidden and deleted rows. Loader, validator, applier, checker and a comment-preserving store. |
+| Hidden rows | `hidden` | Split live rows into managed and hidden, by hidden canonical id or hidden name prefix. |
+| Edit detection | `edits` | Compare the previous mirror with live, field by field, and record the differences in the overrides file. |
+| Deletion confirmation | `deletions` | Decide which mirrored rows the destination has deleted, with a second read. |
+| Ignore list | `ignore` | Match live rows by id or name prefix; a built-in test prefix applies to unscoped runs. A consumer that keeps hidden rows in the overrides file does not use it. |
+| Retire file | `retire` | Per record, the values to remove, each with its exact current value. For fields that do not clear, the only way a value is ever removed; an entry whose value is already gone is reported stale. |
 | Manifests | `manifest` | A hash manifest beside generated output. `check` fails on hand edits and stale output. |
 | State mirror | `mirror` | Reconcile the live rows into mirror rows with their marks. |
+
+## Overrides, edits and deletions
+
+These modules let a registry own every field it writes while people still edit the
+destination by hand. A consumer binds them to its schema with an `OverridesFormat`: the
+file name, the key that holds the entries, the key that holds a deleted row's
+destination id, the fields a pin may name (`pinnable`) and the list fields.
+
+### The overrides file
+
+A mapping with the entries under the format's records key, keyed by canonical id, and an
+optional `hidden_name_prefixes` list. An entry may hold:
+
+| Key | Meaning |
+|---|---|
+| `pin` | Field values that win over the source until someone deletes the pin. `null` pins an empty value, allowed only for a field that clears. The schema's id field can never be pinned. |
+| `<list field>: {add, remove}` | Values added to, or removed from, what the source carries. A `remove` must name a value the source carries. |
+| `pending` | A destination edit waiting for a decision: the field's name for a scalar, `<list field>_add` for added list values. |
+| `hidden: {reason}` | The row is out of the sync on both sides. A reason is required. |
+| `deleted: {<id key>, confirmed}` | The row was deleted at the destination and is never recreated. Deleting the entry brings it back on the next deploy. |
+| `reason` | Free text. |
+
+`load_overrides` raises `ValueError` on a file it cannot read as this shape.
+`override_errors` returns every error, with `file:line`, and never raises.
+`apply_overrides` turns the source's desired rows into the rows a deploy writes: it drops
+hidden and deleted rows, applies pins through one callback (so a consumer can pin a
+value that the destination decorates), then applies each list's additions and removals,
+compared by the field's key. A destination-owned row passes through untouched.
+`check_overrides` fails an entry with no identity, a pin or pending value on a
+destination-owned row, and a remove the source does not carry; it reports a pin equal to
+the source value as redundant. `OverridesStore` edits the file and keeps its comments.
+
+### Pending decisions
+
+`held_rows` names every row with a `pending` value. Pass it to `plan_deploy` and
+`run_check` as `held`, and the plan aborts the row with a reason. `check_overrides`
+returns each pending value, so the consumer's check can fail until someone resolves the
+entry. There are two ways to resolve one. To keep the destination's
+value, move it from `pending` into `pin` (or into a list field's `add`). For the source
+to win, delete the `pending` value, and the next deploy overwrites the destination.
+
+### Hidden rows
+
+`hidden_from` reads the `hidden` entries and prefixes from a loaded file, and
+`partition_hidden` splits live rows into managed and hidden. A row is hidden by the
+canonical id its keys resolve to, else by a name prefix (`startswith` on the live
+label). The built-in test prefix follows the ignore list's scope rule. Pass the result as
+`hidden` to `run_check` and a bound `live_reason` as `exclude` to `apply_deploy`, which
+aborts a row that became hidden between the plan and the write. Pass the hidden rows as
+`other_live`, so their values still count as held for an `exclusive` field.
+
+### Edit detection
+
+`detect_edits` pairs each row of the previous mirror with its desired row and its live
+row, and compares previous with live field by field. A field that differs was edited at
+the destination. When live also differs from desired, the edit needs recording:
+
+| Edit at the destination | Recorded as |
+|---|---|
+| A value cleared, on a field that clears | `clear`: a pin to empty |
+| A list value removed that the source still carries, on a list that clears | `remove`: a list removal |
+| Any other change, or an added list value | `pending`, holding the destination's value |
+| A required field cleared | nothing; the next deploy writes the desired value back |
+
+A live value equal to the desired value is never an edit: it is the deploy's own write
+seen against a mirror that has not caught up. The id field, `KeepIfUnset` fields and
+`Union` fields that do not clear are not recorded. A `base` callback strips what the
+destination adds to a value, such as a suffix the deploy writes, before comparing, so a
+value that differs only by that suffix is not an edit. List values compare by the
+field's key, so a value re-cased at the destination is not an edit. `record_edits`
+writes the edits into an `OverridesStore`.
+
+### Deletion confirmation
+
+A mirrored row can be missing from the live listing for reasons other than deletion (a
+listing cut short, a filtered view). `confirm_deletions` takes each previous-mirror row
+that pairs with no live row and calls `Destination.get` with its live id. `None` confirms
+the deletion, and a returned row is reported as still live. A `DestinationError` from
+`get` propagates, so a failed read never confirms a deletion. This is why `get` must
+return `None` only for not found. A consumer records each confirmed deletion with
+`OverridesStore.mark_deleted`.
+
+### Adopting live values
+
+`adopt_entry` builds the overrides that would keep what a deploy of a desired row would
+otherwise clear: a pin of the live value for each clearing scalar the row leaves empty,
+and an `add` of each live value a clearing list lacks. A consumer uses it to move a
+registry that never owned those fields onto full ownership without clearing anything.
 
 ## Plan, check, apply, restore
 
@@ -148,7 +258,8 @@ policy. Several live rows can share one identity: one primary is written and the
 are reported as known duplicates or as an error. A `DeployPlan` holds `creates`,
 `updates` (target row and live row), `aborts`, `orphans`, `unchanged`, `known_duplicates`,
 `withheld`, `notes`, `errors` and `unacked` (destructive changes not yet acknowledged
-by a retire entry). Orphans are reported and never deleted.
+by a retire entry or a policy that clears). Orphans are reported and never deleted. A row
+named in `held` is aborted with the reason given there.
 
 ### Check (`run_check`)
 
@@ -175,7 +286,8 @@ write-time drift, apply the never-null guard, call `update` with only the planne
 fields, record the written version in the snapshot and verify the row returned.
 
 - **Never-null guard.** A write that holds `None`, `""` or `[]` is refused before the
-  destination is called, unless the change is a retire.
+  destination is called, unless the change is a retire. In a schema with a clearing
+  field, a retire may empty only the fields that clear.
 - **Stop at the first failure.** A destination error, a guard refusal or a
   verification mismatch stops the apply. Later updates are recorded in `plan.aborts` as
   not attempted. The engine never deletes.
