@@ -16,6 +16,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any
 
 from gitops_engine.identity import Identity, IdentitySpec, ItemKeys, MatchKey
+from gitops_engine.overrides import OverridesFormat
 from gitops_engine.schema import (
     Always,
     FieldSpec,
@@ -88,6 +89,11 @@ TOY_IDENTITY_SPEC = IdentitySpec(
     ),
     destination_source="s2",
     file_order=("names", "tags", "sources"),
+)
+
+
+TOY_OVERRIDES = OverridesFormat(
+    "toy-overrides.yaml", "# toy\n", "widgets", "store_id", ("name", "status", "size"), ("tags",)
 )
 
 
@@ -174,6 +180,18 @@ class ToySchema:
     def snapshot_values(self, row: dict[str, Any]) -> dict[str, Any]:
         """Every field, except an empty `status`: a widget cannot clear its status."""
         return {f.name: row[f.name] for f in self.fields if f.name != "status" or row["status"]}
+
+
+class OwnedToySchema(ToySchema):
+    """`ToySchema` where git owns every written field: `tags` and `size` clear."""
+
+    fields = (
+        FieldSpec("name", Always()),
+        FieldSpec("status", Always(), required=True),
+        FieldSpec("ids", Always(unordered=True)),
+        FieldSpec("tags", Union(exclusive=True, item="tag", clears=True)),
+        FieldSpec("size", Always(clears=True)),
+    )
 
 
 # --- walkthrough ---

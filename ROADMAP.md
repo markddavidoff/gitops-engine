@@ -43,13 +43,27 @@ to Linear Customers. Reading it is not required to work on this repo.
   - **Reusable workflow and CLI contract.** `.github/workflows/sync.yml` and
     `docs/cli-contract.md`. The caller supplies a locked uv project, so every job runs
     locked code.
+- **v0.3.0: the registry owns every written field.** It replaces the planned "absorb"
+  step; every new parameter defaults to the v0.2.0 behavior.
+  - **Clearing policies.** `Always(clears=True)` and `Union(clears=True)` write an empty
+    desired value and remove live values the desired list lacks, so retire entries no
+    longer apply to those fields. A `required` field cannot clear.
+  - **Overrides.** One file of pins, list additions and removals, pending edits, hidden
+    and deleted rows, with a validator, an applier, a checker and a comment-preserving
+    store. A row with a pending edit is held: the plan aborts it.
+  - **Edit detection.** The previous mirror is compared with live, field by field.
+    A cleared optional value or a removed list value is recorded as an accepted
+    override; any other change becomes a pending entry, which a person resolves by
+    pinning the value or deleting the entry. This replaces absorb.
+  - **Deletion confirmation.** A mirrored row is recorded as deleted only when it is
+    missing from the listing and `Destination.get` reports it not found. An error never
+    confirms a deletion.
+  - **Hidden rows.** Rows are excluded by canonical id or name prefix, in place of the
+    ignore list, which stays for other consumers.
 
 ## Planned engine features
 
-- [ ] **Absorb.** `run_check` reports untracked values and passes; they do not change
-  the exit code. An *absorb* step would write those values into a curated input file in
-  git so the dataset matches the destination and nobody hand-edits generated files.
-  Today a person records them by hand.
+None open. The one planned feature, absorb, shipped in v0.3.0 (see Done).
 
 ## Library work
 

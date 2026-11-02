@@ -61,11 +61,11 @@ name: sync
 #   triggers no checks).
 # - Inputs, outputs and secrets reach scripts through `env:`, never as `${{ }}`
 #   inside `run:`, so a crafted input cannot inject commands.
-# - The state PR commit touches only the state directory and the snapshots, which
-#   are not deploy inputs, so merging it ends at `plan`. After a retire apply, the
-#   reviewer pushes the deletion of the applied retire entry onto the state PR
-#   branch; that is a deploy input, so the merge runs `deploy`, which plans a
-#   no-op apply the reviewer may approve or reject.
+# - The state PR commit holds the state directory, the snapshots and anything else the
+#   tool's `sync-inbound` changed under the data directory, such as a decision it
+#   recorded in a curated file. A PR that changes only state and snapshots is not a
+#   deploy input, so merging it ends at `plan`. A PR that also changes a deploy input
+#   makes the merge run `deploy`, which plans what the reviewer may approve or reject.
 
 on:
   workflow_call:
@@ -398,6 +398,7 @@ jobs:
           APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
           OUTCOME: ${{ steps.apply.outcome }}
           MODE: ${{ needs.plan.outputs.mode }}
+          DATA_DIR: ${{ steps.paths.outputs.data_dir }}
           STATE_DIR: ${{ steps.paths.outputs.state_dir }}
           SNAPSHOT_DIR: ${{ steps.paths.outputs.snapshot_dir }}
           BASE: ${{ inputs.base_branch }}
@@ -414,13 +415,16 @@ jobs:
 
           branch="sync-state/${RUN_ID}-${RUN_ATTEMPT}"
           git checkout -b "$branch"
-          for dir in "$STATE_DIR" "$SNAPSHOT_DIR"; do
+          # The whole data directory, as the refresh job stages it: the tool's
+          # `sync-inbound` can also record decisions in curated files there. The
+          # state and snapshot directories are staged too, in case they lie outside it.
+          for dir in "$DATA_DIR" "$STATE_DIR" "$SNAPSHOT_DIR"; do
             if [ -e "$dir" ]; then
               git add --all -- "$dir"
             fi
           done
           if git diff --cached --quiet; then
-            echo "No state or snapshot changes; no PR to open."
+            echo "No state, snapshot or data changes; no PR to open."
             exit 0
           fi
           git commit -m "chore: state after ${MODE} (run ${RUN_ID})"

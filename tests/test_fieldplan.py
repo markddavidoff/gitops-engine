@@ -5,7 +5,7 @@ from __future__ import annotations
 import itertools
 
 from toy import TOY_IDENTITY_SPEC as SPEC
-from toy import LiveWidget, ToySchema, Widget
+from toy import LiveWidget, OwnedToySchema, ToySchema, Widget
 
 from gitops_engine.fieldplan import (
     DESTRUCTIVE,
@@ -315,3 +315,52 @@ def test_stale_retire_owned_row_uses_destination_noun():
     assert stale([want(owned=True)], [live(size=7)], retire) == [
         "gear: store-owned stub (retire does not apply)"
     ]
+
+
+# --- clears -----------------------------------------------------------------------
+
+OWNED = OwnedToySchema()  # tags: Union(exclusive, clears), size: Always(clears)
+
+
+def test_clears_scalar_empty_desired_clears_live():
+    target, changes = plan_row(want(size=None), live(size=5), None, schema=OWNED)
+    assert changes == [FieldChange("size", 5, None, "clear", retire=True)]
+    assert target.size is None
+    assert unacknowledged_destructive(changes) == []
+
+
+def test_clears_scalar_empty_on_both_sides_is_no_change():
+    _, changes = plan_row(want(size=None), live(size=None), None, schema=OWNED)
+    assert changes == []
+
+
+def test_clears_list_removes_live_only_values():
+    target, changes = plan_row(want(tags=["a"]), live(tags=["A", "b"]), None, schema=OWNED)
+    assert target.tags == ["A"]
+    assert changes == [FieldChange("tags", "b", None, "remove", retire=True)]
+
+
+def test_clears_list_case_only_difference_is_no_change():
+    target, changes = plan_row(
+        want(tags=["Acme.test"]), live(tags=["acme.test"]), None, schema=OWNED
+    )
+    assert changes == []
+    assert target.tags == ["acme.test"]
+
+
+def test_clears_list_ignores_retire_entries():
+    target, changes = plan_row(want(tags=["a"]), live(tags=["a"]), {"tags": ["a"]}, schema=OWNED)
+    assert changes == [] and target.tags == ["a"]
+
+
+def test_clears_fields_have_no_untracked():
+    got = untracked_values(
+        [want(tags=[])],
+        [live(tags=["x.io"], size=300)],
+        IdentityTable(),
+        {},
+        schema=OWNED,
+        spec=SPEC,
+        implicit=implicit,
+    )
+    assert got == []

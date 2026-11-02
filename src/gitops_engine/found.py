@@ -44,6 +44,7 @@ def build_found[R, L](
     stub: Callable[[str, L, R | None], R],
     new_values: Callable[[L], dict[str, list[str]]],
     learned_values: Callable[[L], dict[str, list[str]]],
+    learn_with_record: bool = True,
 ) -> FoundBuild[R]:
     """Stubs for the managed live rows whose identity has no `primary_dataset` record.
 
@@ -58,7 +59,10 @@ def build_found[R, L](
     the file stem of its previous stub, if any). `stub(cid, row, previous)` builds the
     stub record; `previous` is the record the identity's last stub held. `new_values`
     gives a new identity its match values; `learned_values` gives the primary row's
-    values appended to an existing identity."""
+    values appended to an existing identity. With `learn_with_record=False`, an
+    identity that has a `primary_dataset` record learns only the primary row's
+    destination id: a value added at the destination then reaches the desired row
+    only through an override, never through the identity table."""
     out: FoundBuild[R] = FoundBuild()
     old = [e for e in entries if e.dataset == found_dataset]
     stem_by_live: dict[str, str] = {}
@@ -122,10 +126,9 @@ def build_found[R, L](
                 for lv in group
                 if lv is not primary
             ]
+            learned = learned_values(primary) if learn_with_record or cid not in with_record else {}
             store.add_values(
-                cid,
-                sources={spec.destination_source: schema.live_id(primary)},
-                **learned_values(primary),
+                cid, sources={spec.destination_source: schema.live_id(primary)}, **learned
             )
         if cid in with_record:
             continue

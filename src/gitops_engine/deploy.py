@@ -12,7 +12,7 @@ never deleted.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -23,7 +23,7 @@ from .identity import Identity, IdentitySpec, IdentityTable
 from .ignore import IgnoreList
 from .pairing import pair_rows
 from .retire import RetireEntry
-from .schema import Always, FieldSpec, RecordSchema, Union
+from .schema import Always, FieldSpec, KeepIfUnset, RecordSchema, Union, clears
 from .snapshot import record_written, write_snapshot
 
 NOT_ATTEMPTED = "not attempted: apply stopped at an earlier failure"
@@ -112,6 +112,7 @@ def plan_deploy[D, L](
     state: list[D] | None = None,
     retire: dict[str, RetireEntry] | None = None,
     other_live: list[L] | None = None,
+    held: Mapping[str, str] | None = None,
 ) -> DeployPlan[D, L]:
     """Diff desired against live, paired by identity.
 
@@ -122,7 +123,9 @@ def plan_deploy[D, L](
 
     `updates` holds `(target, live)`, where target is the effective row to write.
     `retire` is keyed by the desired row's first id. `other_live` are live rows the
-    plan never writes whose exclusive values still count as held."""
+    plan never writes whose exclusive values still count as held. `held` maps a
+    canonical id to why its paired row must not be written (a pending decision): the
+    row goes to `aborts` with that reason."""
     nouns = schema.nouns
     plan: DeployPlan[D, L] = DeployPlan()
     state_by_id: dict[str, D] = {}
@@ -153,6 +156,9 @@ def plan_deploy[D, L](
             plan.creates.append(_withhold_shared(d, None, holders, plan, schema))
             continue
         ids = schema.desired_value(d, schema.id_field) or []
+        if held and ids and ids[0] in held:
+            plan.aborts.append((d, lv, held[ids[0]]))
+            continue
         st = next((state_by_id[x] for x in ids if x in state_by_id), None)
         if st is None:
             st = state_by_live.get(schema.live_id(lv))
@@ -249,6 +255,19 @@ def _mismatch[D, L](
     return None
 
 
+def _clearable(schema: RecordSchema[Any, Any]) -> set[str] | None:
+    """The fields a retire write may empty, once some field's policy clears: those that
+    clear, and the `KeepIfUnset` and `Union` fields a retire entry may still empty.
+    None (any field, as in v0.2.0) for a schema where no field clears."""
+    if not any(clears(f.policy) for f in schema.fields):
+        return None
+    return {
+        f.name
+        for f in schema.fields
+        if clears(f.policy) or isinstance(f.policy, (KeepIfUnset, Union))
+    }
+
+
 def apply_deploy[D, L](
     plan: DeployPlan[D, L],
     dest: Destination[L],
@@ -257,6 +276,7 @@ def apply_deploy[D, L](
     snapshot_dir: Path,
     ignore: IgnoreList | None = None,
     scope: str | None = None,
+    exclude: Callable[[L], str | None] | None = None,
 ) -> ApplyResult[D]:
     """Execute creates and updates.
 
@@ -264,15 +284,23 @@ def apply_deploy[D, L](
     `dest.preflight` -> snapshot of every live row in `plan.updates` (an `OSError`
     propagates before any write) -> creates (non-empty values only) -> per update:
     check-and-set re-read, ignore match on the current row, write-time drift abort,
-    the never-null guard, `dest.update` with only the planned fields (`retire=True`
+    the never-null guard (`_clearable` names the fields a retire may empty),
+    `dest.update` with only the planned fields (`retire=True`
     when a planned change is destructive), record the written version in the
     snapshot, then verify the returned row.
 
-    A destination error, a guard refusal or a mismatch sets `failure` and stops: the
-    later updates are recorded in `plan.aborts` as not attempted. A row the current
-    `ignore` list matches (default: the built-in prefix) is aborted, never written."""
+    A destination error (the re-read's included), a guard refusal or a mismatch sets
+    `failure` and stops: the later updates are recorded in `plan.aborts` as not
+    attempted. A row the current
+    `ignore` list matches (default: the built-in prefix) is aborted, never written.
+    `exclude`, when given, replaces that match: a row it gives a reason for (the current
+    row, e.g. `hidden.live_reason` bound to the run) is aborted. Passing both raises
+    `ValueError`."""
+    if ignore is not None and exclude is not None:
+        raise ValueError("apply_deploy: pass ignore and exclude, not both")
     if plan.errors:
         raise ValueError(f"planner error(s), nothing written: {plan.errors}")
+    clearable = _clearable(schema)
     if plan.unacked or any(unacknowledged_destructive(cs) for cs in plan.changes.values()):
         raise ValueError(f"unacknowledged destructive change(s), nothing written: {plan.unacked}")
     create_values = [_all_values(schema, d) for d in plan.creates]
@@ -303,14 +331,24 @@ def apply_deploy[D, L](
         changes = plan.changes.get(live_id, [])
         if not changes:
             continue
-        cur = dest.get(live_id)  # write-time re-read (check-and-set)
+        try:
+            cur = dest.get(live_id)  # write-time re-read (check-and-set)
+        except DestinationError as e:
+            result.failure = f"{schema.label(d)}: re-read failed: {e}"
+            continue
         if cur is None:
             plan.aborts.append((d, lv0, "gone at write time"))
             continue
-        ignored = ignore.match(schema.live_id(cur), schema.live_label(cur), scope=scope)
-        if ignored is not None:
-            plan.aborts.append((d, lv0, f"ignored at write time: {ignored.reason}"))
-            continue
+        if exclude is not None:
+            reason = exclude(cur)
+            if reason is not None:
+                plan.aborts.append((d, lv0, f"hidden at write time: {reason}"))
+                continue
+        else:
+            ignored = ignore.match(schema.live_id(cur), schema.live_label(cur), scope=scope)
+            if ignored is not None:
+                plan.aborts.append((d, lv0, f"ignored at write time: {ignored.reason}"))
+                continue
         # Guard every update, first-link rows included: if the row changed since plan
         # time, abort rather than clobber a concurrent edit.
         now, then = schema.live_version(cur), schema.live_version(lv0)
@@ -318,9 +356,10 @@ def apply_deploy[D, L](
             plan.aborts.append((d, lv0, f"write-time drift {now} != {then}"))
             continue
         retire = any(c.kind in DESTRUCTIVE for c in changes)
-        empty = refused_empty(values, retire=retire)
+        empty = refused_empty(values, retire=retire, clearable=clearable)
         if empty is not None:
-            result.failure = f"{schema.label(d)}: update refused: empty {empty} without retire"
+            why = "is not clearable" if retire else "without retire"
+            result.failure = f"{schema.label(d)}: update refused: empty {empty} {why}"
             continue
         try:
             lv = dest.update(schema.live_id(cur), values, retire=retire)

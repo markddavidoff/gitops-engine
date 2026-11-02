@@ -33,7 +33,7 @@ def record_keys(entry: DatasetRecord[Widget]) -> ItemKeys:
     return ItemKeys(label=w.name, sources=((SRC, entry.source_id),), values=values)
 
 
-def build(managed, store, entries=(), calls=None) -> FoundBuild[Widget]:
+def build(managed, store, entries=(), calls=None, **kw) -> FoundBuild[Widget]:
     def stub(cid: str, lv: LiveWidget, prev: Widget | None) -> Widget:
         if calls is not None:
             calls.append((cid, lv.live_id, prev))
@@ -52,6 +52,7 @@ def build(managed, store, entries=(), calls=None) -> FoundBuild[Widget]:
         stub=stub,
         new_values=lambda lv: {"names": [lv.name], "tags": list(lv.tags)},
         learned_values=lambda lv: {"tags": list(lv.tags)},
+        **kw,
     )
 
 
@@ -82,6 +83,17 @@ def test_found_skips_identity_with_primary_record(tmp_path):
     assert store.table.entries["gear"].values["tags"] == ["red", "blue"]
     # An existing identity learns only `learned_values`: the row's name is not appended.
     assert "Gear" not in store.table.entries["gear"].values.get("names", [])
+
+
+def test_found_learns_no_values_for_record_backed_identity(tmp_path):
+    store = store_with(tmp_path, gear={"tags": ["red"], "sources": {SRC: "gear-file"}})
+    entries = [DatasetRecord(PRIMARY, "gear-file", Widget(name="Gear", status="ok"))]
+    got = build([live("L1", "Gear", tags=["red", "blue"])], store, entries, learn_with_record=False)
+    assert got.stubs == []
+    # The identity gains only the destination source: a value added at the destination
+    # must not reach the desired row through the identity table.
+    assert store.table.entries["gear"].sources == {SRC: "gear-file", DEST: "L1"}
+    assert store.table.entries["gear"].values["tags"] == ["red"]
 
 
 def test_found_ambiguous_records_nothing(tmp_path):

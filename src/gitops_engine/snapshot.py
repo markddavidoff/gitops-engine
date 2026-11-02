@@ -126,9 +126,9 @@ def restore[L](
 
     `rows` filters by the schema's id field. The schema's `snapshot_values` decides
     what each row sends; a row holding an empty value is sent with `retire=True`. The
-    destination's preflight runs before any write. A destination error on a row sets
-    `failure` and stops: rows restored so far stay listed, later rows are not
-    attempted."""
+    destination's preflight runs before any write. A destination error on a row (its
+    re-read included) sets `failure` and stops: rows restored so far stay listed,
+    later rows are not attempted."""
     snap = load_snapshot(path, schema=schema)
     if rows is not None:
         wanted = set(rows)
@@ -140,7 +140,11 @@ def restore[L](
     result = RestoreResult(restored=[], skipped=[])
     for r, send in zip(snap, sends, strict=True):
         live_id = r[id_key]
-        cur = dest.get(live_id)
+        try:
+            cur = dest.get(live_id)
+        except DestinationError as e:
+            result.failure = f"{live_id}: re-read failed: {e}"
+            break
         if cur is None:
             result.skipped.append((live_id, "gone"))
             continue

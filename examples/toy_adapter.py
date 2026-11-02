@@ -22,7 +22,9 @@ class ToyDestination:
     `statuses` limits the statuses `preflight` resolves (None resolves all). `fail`
     maps a live id (update) or a name (create) to the error message the write raises.
     `tamper` maps a live id to field values the store returns instead of the written
-    ones, standing in for a destination that does not apply what it was sent."""
+    ones, standing in for a destination that does not apply what it was sent.
+    `get_errors` holds live ids whose `get` raises `DestinationError`, and `unlisted`
+    live ids that `list_live` omits though `get` still finds them."""
 
     def __init__(
         self,
@@ -31,12 +33,16 @@ class ToyDestination:
         statuses: set[str] | None = None,
         fail: dict[str, str] | None = None,
         tamper: dict[str, dict[str, Any]] | None = None,
+        get_errors: set[str] | None = None,
+        unlisted: set[str] | None = None,
     ) -> None:
         self.rows: dict[str, LiveWidget] = {lv.live_id: lv for lv in rows or []}
         self.calls: list[tuple[Any, ...]] = []
         self._statuses = statuses
         self._fail = fail or {}
         self._tamper = tamper or {}
+        self._get_errors = get_errors or set()
+        self._unlisted = unlisted or set()
         self._n = 0
 
     def _version(self) -> str:
@@ -44,10 +50,12 @@ class ToyDestination:
         return f"w{self._n}"
 
     def list_live(self) -> list[LiveWidget]:
-        return list(self.rows.values())
+        return [lv for lv in self.rows.values() if lv.live_id not in self._unlisted]
 
     def get(self, live_id: str) -> LiveWidget | None:
         self.calls.append(("get", live_id))
+        if live_id in self._get_errors:
+            raise DestinationError(f"get {live_id} failed")
         return self.rows.get(live_id)
 
     def preflight(self, writes: list[dict[str, Any]], *, restoring: bool = False) -> None:

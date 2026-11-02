@@ -9,6 +9,9 @@ follows the policy the schema declares for it:
 - `Union`: the desired values unioned with live, minus retired ones. Values compare
   through `Union.key`, and a value live already holds keeps its live spelling. A
   live-only value is dropped only when a retire entry names it.
+- A policy that `clears` (`Always` or `Union`) owns the field outright, empty values
+  included: an empty desired scalar clears live, and a live list value not desired is
+  removed. Retire entries do not apply to it.
 - `KeepIfUnset`: desired wins when it has a value, else live is kept. A retire entry
   whose value equals live clears it.
 
@@ -17,8 +20,9 @@ A destination-owned row takes every value from live and can change only its
 Retire entries never apply to it.
 
 `remove` and `clear` are destructive. The planner emits them only from a retire entry
-and marks them `retire=True`; `unacknowledged_destructive` finds any that are not,
-which callers treat as a planner bug.
+or a policy that `clears`, and marks them `retire=True` (acknowledged);
+`unacknowledged_destructive` finds any that are not, which callers treat as a planner
+bug.
 """
 
 from __future__ import annotations
@@ -30,7 +34,7 @@ from typing import Any, Literal
 from .identity import Identity, IdentitySpec, IdentityTable
 from .pairing import pair_rows
 from .retire import RetireEntry
-from .schema import Always, FieldSpec, KeepIfUnset, RecordSchema, Union
+from .schema import Always, FieldSpec, KeepIfUnset, RecordSchema, Union, clears
 
 ChangeKind = Literal["set", "change", "add", "remove", "clear"]
 DESTRUCTIVE: frozenset[str] = frozenset({"remove", "clear"})
@@ -77,15 +81,29 @@ def _unordered(name: str, old: list[Any], new: list[Any]) -> list[FieldChange]:
     return [FieldChange(name, list(old), list(new), "change")]
 
 
+def _cleared(name: str, desired: Any, live: Any) -> tuple[Any, list[FieldChange]] | None:
+    """An empty desired value under `clears`: a clear when live holds a value, else no
+    change. None when desired is not empty."""
+    if not _empty(desired):
+        return None
+    if _empty(live):
+        return desired, []
+    return desired, [FieldChange(name, live, None, "clear", retire=True)]
+
+
 def _union(
     name: str,
     desired: list[str],
     live: list[str],
     retired: list[str],
     key: Callable[[str], str],
+    *,
+    replace: bool = False,
 ) -> tuple[list[str], list[FieldChange]]:
+    """Desired values plus live ones. With `replace` (a policy that clears) the
+    target is the desired values alone and retire entries are ignored."""
     live_by_key = {key(v): v for v in live}
-    retired_keys = {key(v) for v in retired}
+    retired_keys = set() if replace else {key(v) for v in retired}
     target: list[str] = []
     seen: set[str] = set()
     changes: list[FieldChange] = []
@@ -104,7 +122,7 @@ def _union(
         if k in seen:
             continue
         seen.add(k)
-        if k in retired_keys:
+        if replace or k in retired_keys:
             changes.append(FieldChange(name, v, None, "remove", retire=True))
         else:
             target.append(v)
@@ -127,11 +145,13 @@ def _plan_field(
 ) -> tuple[Any, list[FieldChange]]:
     policy = f.policy
     if isinstance(policy, Always):
+        if policy.clears and (cleared := _cleared(f.name, desired, live)) is not None:
+            return cleared
         if policy.unordered:
             return list(desired), _unordered(f.name, live, desired)
         return desired, _plain(f.name, live, desired)
     if isinstance(policy, Union):
-        return _union(f.name, desired, live, retired or [], policy.key)
+        return _union(f.name, desired, live, retired or [], policy.key, replace=policy.clears)
     assert isinstance(policy, KeepIfUnset)
     return _keep_if_unset(f.name, desired, live, retired)
 
@@ -196,7 +216,8 @@ def untracked_values[D, L](
 
     A live `Union` value absent from the desired row (compared through its key), or a
     live `KeepIfUnset` value where the desired row has none, is untracked unless a
-    retire entry names it. Unpaired live rows and destination-owned rows are skipped."""
+    retire entry names it. A field whose policy clears has none: the plan writes every
+    value it holds. Unpaired live rows and destination-owned rows are skipped."""
     out: list[Untracked] = []
     for d, lv in _paired(desired, live, table, schema, spec, implicit):
         if lv is None or schema.destination_owned(d):
@@ -205,6 +226,8 @@ def untracked_values[D, L](
         entry = (retire or {}).get(xid) or {}
         label = schema.label(d)
         for f in schema.fields:
+            if clears(f.policy):
+                continue
             want = schema.desired_value(d, f.name)
             have = schema.live_value(lv, f.name)
             if isinstance(f.policy, Union):

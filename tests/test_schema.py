@@ -14,6 +14,7 @@ from gitops_engine.schema import (
     RecordSchema,
     SyncMark,
     Union,
+    clears,
 )
 
 
@@ -112,3 +113,14 @@ def test_toy_keys_reduce_desired_and_live_rows_to_item_keys():
     assert schema.live_keys(_live()) == ItemKeys(
         label="Gear", ids=("g-1",), values=(("tags", ("a", "b")),)
     )
+
+
+def test_clears_defaults_off_and_reads_the_policy():
+    assert clears(Always()) is False and clears(Union()) is False
+    assert clears(KeepIfUnset()) is False
+    assert clears(Always(clears=True)) is True and clears(Union(clears=True)) is True
+
+
+def test_required_field_cannot_clear():
+    with pytest.raises(ValueError, match="status: a required field cannot clear"):
+        FieldSpec("status", Always(clears=True), required=True)
