@@ -21,6 +21,7 @@ from .schema import (
     RecordSchema,
     SyncMark,
     Union,
+    clears,
 )
 from .snapshot import RestoreResult, restore
 
@@ -52,6 +53,7 @@ __all__ = [
     "SyncMark",
     "Union",
     "apply_deploy",
+    "clears",
     "detect_drift",
     "identity_offline_errors",
     "manifest_errors",

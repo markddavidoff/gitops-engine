@@ -8,10 +8,12 @@ from pathlib import Path
 
 import pytest
 from toy import TOY_IDENTITY_SPEC as SPEC
-from toy import LiveWidget, ToySchema, Widget
+from toy import LiveWidget, OwnedToySchema, ToySchema, Widget
 from toy_adapter import ToyDestination
 
+from gitops_engine import deploy
 from gitops_engine.deploy import ApplyResult, DeployPlan, apply_deploy, plan_deploy
+from gitops_engine.destination import refused_empty
 from gitops_engine.fieldplan import FieldChange
 from gitops_engine.identity import Identity, IdentityTable
 from gitops_engine.ignore import IgnoreEntry, IgnoreList
@@ -310,3 +312,81 @@ def test_unwritable_snapshot_dir_aborts_before_any_write(tmp_path):
     with pytest.raises(OSError):
         apply(p, dest, tmp_path)
     assert writes(dest) == []
+
+
+# --- clears and the clearable guard -----------------------------------------------
+
+OWNED = OwnedToySchema()  # tags: Union(exclusive, clears), size: Always(clears)
+
+
+def test_refused_empty_respects_clearable():
+    assert refused_empty({"name": "", "size": None}, retire=True, clearable={"size"}) == "name"
+    assert refused_empty({"size": None}, retire=True, clearable={"size"}) is None
+    # without clearable, retire allows every empty value (v0.2.0)
+    assert refused_empty({"name": "", "size": None}, retire=True) is None
+    assert refused_empty({"size": None}, retire=False, clearable={"size"}) == "size"
+
+
+def _spy_clearable(monkeypatch) -> list:
+    seen: list = []
+
+    def spy(values, *, retire, clearable=None):
+        seen.append(clearable)
+        return refused_empty(values, retire=retire, clearable=clearable)
+
+    monkeypatch.setattr(deploy, "refused_empty", spy)
+    return seen
+
+
+def test_apply_without_clears_keeps_v020_refusal(tmp_path, monkeypatch):
+    seen = _spy_clearable(monkeypatch)
+    # an empty `name` beside a retire: v0.2.0 lets retire through, so it is written
+    lv = live(size=3)
+    target = want(name="", ids=["gear"], size=None)
+    changes = [
+        FieldChange("name", "Gear", "", "change"),
+        FieldChange("size", 3, None, "clear", retire=True),
+    ]
+    p = DeployPlan(updates=[(target, lv)], changes={"L1": changes})
+    dest = ToyDestination([lv])
+    apply(p, dest, tmp_path)
+    assert seen == [None]
+    assert writes(dest) == [("update", "L1", {"name": "", "size": None}, True)]
+    # without a retire, the same empty `name` is refused, as in v0.2.0
+    lv = live(size=3)
+    p = DeployPlan(
+        updates=[(target, lv)], changes={"L1": [FieldChange("name", "Gear", "", "change")]}
+    )
+    dest = ToyDestination([lv])
+    res = apply(p, dest, tmp_path)
+    assert writes(dest) == []
+    assert res.failure == ": update refused: empty name without retire"
+
+
+def test_apply_with_clears_refuses_empty_field_outside_clearable(tmp_path, monkeypatch):
+    seen = _spy_clearable(monkeypatch)
+    lv = live(size=3)
+    target = want(name="", ids=["gear"], size=None)
+    changes = [
+        FieldChange("name", "Gear", "", "change"),
+        FieldChange("size", 3, None, "clear", retire=True),
+    ]
+    p = DeployPlan(updates=[(target, lv)], changes={"L1": changes})
+    dest = ToyDestination([lv])
+    res = apply_deploy(p, dest, schema=OWNED, snapshot_dir=tmp_path / "snaps")
+    assert seen == [{"tags", "size"}]
+    assert writes(dest) == []
+    assert res.failure == ": update refused: empty name is not clearable"
+
+
+def test_apply_clear_sends_retire(tmp_path):
+    lv = live(size=5)
+    dest = ToyDestination([lv])
+    p = plan_deploy(
+        [want(size=None)], [lv], IdentityTable(), schema=OWNED, spec=SPEC, implicit=implicit
+    )
+    assert p.changes["L1"] == [FieldChange("size", 5, None, "clear", retire=True)]
+    res = apply_deploy(p, dest, schema=OWNED, snapshot_dir=tmp_path / "snaps")
+    assert writes(dest) == [("update", "L1", {"size": None}, True)]
+    assert res.failure is None
+    assert dest.rows["L1"].size is None

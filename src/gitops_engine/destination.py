@@ -6,6 +6,7 @@ by the schema's field names; the destination maps them onto its own write calls.
 
 from __future__ import annotations
 
+from collections.abc import Collection
 from typing import Any, Protocol, runtime_checkable
 
 
@@ -13,13 +14,19 @@ def is_empty(value: Any) -> bool:
     return value is None or value == "" or value == []
 
 
-def refused_empty(values: dict[str, Any], *, retire: bool) -> str | None:
-    """The never-null guard: the first field holding `None`, `""` or `[]` in a write
-    that is not a retire, else None. Apply checks it before the destination is called,
-    so a sync never clears a value by accident."""
-    if retire:
+def refused_empty(
+    values: dict[str, Any], *, retire: bool, clearable: Collection[str] | None = None
+) -> str | None:
+    """The never-null guard: the first field holding `None`, `""` or `[]` that the
+    write may not empty, else None. Apply checks it before the destination is called,
+    so a sync never clears a value by accident.
+
+    Without `clearable`, a retire may empty any field and any other write none. With
+    `clearable`, only a retire may empty a field, and only a field in `clearable`."""
+    if retire and clearable is None:
         return None
-    return next((k for k, v in values.items() if is_empty(v)), None)
+    allowed = clearable if retire and clearable is not None else ()
+    return next((k for k, v in values.items() if is_empty(v) and k not in allowed), None)
 
 
 class DestinationError(RuntimeError):

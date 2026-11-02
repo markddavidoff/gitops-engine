@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from toy import TOY_IDENTITY_SPEC as SPEC
-from toy import LiveWidget, ToySchema, Widget
+from toy import LiveWidget, OwnedToySchema, ToySchema, Widget
 
 from gitops_engine.deploy import DeployPlan, plan_deploy
 from gitops_engine.fieldplan import FieldChange
@@ -143,3 +143,21 @@ def test_pairing_errors_and_duplicates_are_carried():
     b = live("Gear", live_id="L2", ids=("gear",))
     p = plan([want()], [a, b])
     assert p.errors and "two or more store widgets carry the canonical id gear" in p.errors[0]
+
+
+def test_withholding_with_clears():
+    other = live("Cog", live_id="L2", ids=("cog",), tags=("x",))
+    p = plan_deploy(
+        [want(tags=("x",))],
+        [live(tags=("y",)), other],
+        IdentityTable(),
+        schema=OwnedToySchema(),
+        spec=SPEC,
+        implicit=implicit,
+    )
+    [(target, _)] = p.updates
+    assert target.tags == []
+    assert p.changes["L1"] == [FieldChange("tags", "y", None, "remove", retire=True)]
+    assert p.unacked == []
+    [line] = p.withheld
+    assert "'x'" in line and "'Cog'" in line

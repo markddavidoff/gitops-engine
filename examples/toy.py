@@ -176,6 +176,18 @@ class ToySchema:
         return {f.name: row[f.name] for f in self.fields if f.name != "status" or row["status"]}
 
 
+class OwnedToySchema(ToySchema):
+    """`ToySchema` where git owns every written field: `tags` and `size` clear."""
+
+    fields = (
+        FieldSpec("name", Always()),
+        FieldSpec("status", Always(), required=True),
+        FieldSpec("ids", Always(unordered=True)),
+        FieldSpec("tags", Union(exclusive=True, item="tag", clears=True)),
+        FieldSpec("size", Always(clears=True)),
+    )
+
+
 # --- walkthrough ---
 
 

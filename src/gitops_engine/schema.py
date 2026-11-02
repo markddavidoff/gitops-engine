@@ -50,9 +50,11 @@ class Always:
     """A scalar or list field the plan owns outright: desired replaces live.
 
     With `unordered`, values compare sorted and every difference is kind `"change"`.
+    With `clears`, an empty desired value clears a live value that is not empty.
     """
 
     unordered: bool = False
+    clears: bool = False
 
 
 @dataclass(frozen=True)
@@ -63,11 +65,16 @@ class Union:
     `exclusive` marks a field whose values belong to one record at a time: the plan
     withholds a value another live record already holds. `item` names one value in
     the messages that report it.
+
+    With `clears`, the plan owns the list outright: the target is the desired values
+    (each keeping its live spelling), every live value whose key is not desired is
+    removed, and retire entries do not apply.
     """
 
     key: Callable[[str], str] = str.lower
     exclusive: bool = False
     item: str = "value"
+    clears: bool = False
 
 
 @dataclass(frozen=True)
@@ -76,6 +83,11 @@ class KeepIfUnset:
 
 
 Policy = Always | Union | KeepIfUnset
+
+
+def clears(policy: Policy) -> bool:
+    """Whether the policy writes an empty desired value: a clear or a removal."""
+    return isinstance(policy, (Always, Union)) and policy.clears
 
 
 @dataclass(frozen=True)
@@ -90,6 +102,10 @@ class FieldSpec:
     name: str
     policy: Policy
     required: bool = False
+
+    def __post_init__(self) -> None:
+        if self.required and clears(self.policy):
+            raise ValueError(f"{self.name}: a required field cannot clear")
 
 
 @runtime_checkable

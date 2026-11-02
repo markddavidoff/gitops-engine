@@ -23,7 +23,7 @@ from .identity import Identity, IdentitySpec, IdentityTable
 from .ignore import IgnoreList
 from .pairing import pair_rows
 from .retire import RetireEntry
-from .schema import Always, FieldSpec, RecordSchema, Union
+from .schema import Always, FieldSpec, KeepIfUnset, RecordSchema, Union, clears
 from .snapshot import record_written, write_snapshot
 
 NOT_ATTEMPTED = "not attempted: apply stopped at an earlier failure"
@@ -249,6 +249,19 @@ def _mismatch[D, L](
     return None
 
 
+def _clearable(schema: RecordSchema[Any, Any]) -> set[str] | None:
+    """The fields a retire write may empty, once some field's policy clears: those that
+    clear, and the `KeepIfUnset` and `Union` fields a retire entry may still empty.
+    None (any field, as in v0.2.0) for a schema where no field clears."""
+    if not any(clears(f.policy) for f in schema.fields):
+        return None
+    return {
+        f.name
+        for f in schema.fields
+        if clears(f.policy) or isinstance(f.policy, (KeepIfUnset, Union))
+    }
+
+
 def apply_deploy[D, L](
     plan: DeployPlan[D, L],
     dest: Destination[L],
@@ -264,7 +277,8 @@ def apply_deploy[D, L](
     `dest.preflight` -> snapshot of every live row in `plan.updates` (an `OSError`
     propagates before any write) -> creates (non-empty values only) -> per update:
     check-and-set re-read, ignore match on the current row, write-time drift abort,
-    the never-null guard, `dest.update` with only the planned fields (`retire=True`
+    the never-null guard (`_clearable` names the fields a retire may empty),
+    `dest.update` with only the planned fields (`retire=True`
     when a planned change is destructive), record the written version in the
     snapshot, then verify the returned row.
 
@@ -273,6 +287,7 @@ def apply_deploy[D, L](
     `ignore` list matches (default: the built-in prefix) is aborted, never written."""
     if plan.errors:
         raise ValueError(f"planner error(s), nothing written: {plan.errors}")
+    clearable = _clearable(schema)
     if plan.unacked or any(unacknowledged_destructive(cs) for cs in plan.changes.values()):
         raise ValueError(f"unacknowledged destructive change(s), nothing written: {plan.unacked}")
     create_values = [_all_values(schema, d) for d in plan.creates]
@@ -318,9 +333,10 @@ def apply_deploy[D, L](
             plan.aborts.append((d, lv0, f"write-time drift {now} != {then}"))
             continue
         retire = any(c.kind in DESTRUCTIVE for c in changes)
-        empty = refused_empty(values, retire=retire)
+        empty = refused_empty(values, retire=retire, clearable=clearable)
         if empty is not None:
-            result.failure = f"{schema.label(d)}: update refused: empty {empty} without retire"
+            why = "is not clearable" if retire else "without retire"
+            result.failure = f"{schema.label(d)}: update refused: empty {empty} {why}"
             continue
         try:
             lv = dest.update(schema.live_id(cur), values, retire=retire)
