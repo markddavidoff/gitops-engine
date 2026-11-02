@@ -222,13 +222,23 @@ def _state_hidden[D](
     s: D,
     hidden_ids: set[str],
     hidden: Hidden,
-    scope: str | None,
+    table: IdentityTable,
+    *,
     schema: RecordSchema[D, Any],
+    spec: IdentitySpec,
+    scope: str | None,
 ) -> bool:
+    """A state row of a hidden row: its live id is hidden, its keys resolve to a hidden
+    canonical id (the row may be gone from the destination), or its label matches an
+    active prefix."""
     mark = schema.mark(s)
     if mark is None:
         return False
-    return mark.live_id in hidden_ids or hidden.prefix_for(schema.label(s), scope=scope) is not None
+    if mark.live_id in hidden_ids:
+        return True
+    hit = resolve(schema.desired_keys(s), table, spec)
+    cid = hit.canonical_id if hit is not None else None
+    return hidden.match(cid, schema.label(s), scope=scope) is not None
 
 
 def _no_hooks() -> DatasetHooks[Any]:
@@ -289,7 +299,13 @@ def run_check[D, L, R](
             live, hidden, table, schema=schema, spec=spec, scope=scope
         )
         hidden_ids = {schema.live_id(lv) for lv in ignored}
-        state = [s for s in state if not _state_hidden(s, hidden_ids, hidden, scope, schema)]
+        state = [
+            s
+            for s in state
+            if not _state_hidden(
+                s, hidden_ids, hidden, table, schema=schema, spec=spec, scope=scope
+            )
+        ]
         failures, reports = hidden_conflicts(
             ignored, hidden, entries or [], desired, table, **bound, **conflict_hooks
         )

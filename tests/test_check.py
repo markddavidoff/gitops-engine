@@ -271,6 +271,19 @@ def test_run_check_hidden_row_is_not_orphan_or_drift():
     assert res.drift.changed and res.orphans == [now] and res.code == EXIT_DRIFT
 
 
+def test_run_check_hidden_row_gone_from_store_drops_its_state_row():
+    tbl = table(gear={"values": {"tags": ["red"]}}, w_h={"values": {"tags": ["hid"]}})
+    gear = live()
+    gone = live("Secret", live_id="L_h", ids=(), tags=("hid",))  # no longer in the store
+    state = [recorded(gear), recorded(gone)]
+    kw = {"ignore": None, "entries": [record()]}
+    res = check([want()], state, [gear], tbl, hidden=_hidden({"w_h": "a test"}), **kw)
+    assert res.code == EXIT_OK and not res.drift.any() and res.failures == []
+    # control: without the hidden entry the missing row is deleted drift
+    res = check([want()], state, [gear], tbl, hidden=_hidden(), **kw)
+    assert res.drift.any() and res.code == EXIT_DRIFT
+
+
 def test_run_check_hidden_prefix_on_desired_identity_fails():
     gear = live()
     sand = live("test-gear", live_id="L_t", ids=(), tags=("red",))
