@@ -276,6 +276,7 @@ def apply_deploy[D, L](
     snapshot_dir: Path,
     ignore: IgnoreList | None = None,
     scope: str | None = None,
+    exclude: Callable[[L], str | None] | None = None,
 ) -> ApplyResult[D]:
     """Execute creates and updates.
 
@@ -290,7 +291,12 @@ def apply_deploy[D, L](
 
     A destination error, a guard refusal or a mismatch sets `failure` and stops: the
     later updates are recorded in `plan.aborts` as not attempted. A row the current
-    `ignore` list matches (default: the built-in prefix) is aborted, never written."""
+    `ignore` list matches (default: the built-in prefix) is aborted, never written.
+    `exclude`, when given, replaces that match: a row it gives a reason for (the current
+    row, e.g. `hidden.live_reason` bound to the run) is aborted. Passing both raises
+    `ValueError`."""
+    if ignore is not None and exclude is not None:
+        raise ValueError("apply_deploy: pass ignore and exclude, not both")
     if plan.errors:
         raise ValueError(f"planner error(s), nothing written: {plan.errors}")
     clearable = _clearable(schema)
@@ -328,10 +334,16 @@ def apply_deploy[D, L](
         if cur is None:
             plan.aborts.append((d, lv0, "gone at write time"))
             continue
-        ignored = ignore.match(schema.live_id(cur), schema.live_label(cur), scope=scope)
-        if ignored is not None:
-            plan.aborts.append((d, lv0, f"ignored at write time: {ignored.reason}"))
-            continue
+        if exclude is not None:
+            reason = exclude(cur)
+            if reason is not None:
+                plan.aborts.append((d, lv0, f"hidden at write time: {reason}"))
+                continue
+        else:
+            ignored = ignore.match(schema.live_id(cur), schema.live_label(cur), scope=scope)
+            if ignored is not None:
+                plan.aborts.append((d, lv0, f"ignored at write time: {ignored.reason}"))
+                continue
         # Guard every update, first-link rows included: if the row changed since plan
         # time, abort rather than clobber a concurrent edit.
         now, then = schema.live_version(cur), schema.live_version(lv0)

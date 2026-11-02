@@ -17,11 +17,11 @@ with an id (under `IgnoreFormat.id_key`), an optional name and a reason; and
 from __future__ import annotations
 
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from io import StringIO
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from ruamel.yaml import YAML
 from ruamel.yaml.comments import CommentedMap, CommentedSeq
@@ -30,6 +30,7 @@ from ruamel.yaml.scalarstring import DoubleQuotedScalarString
 
 from .datasets import DatasetRecord
 from .identity import (
+    Hit,
     Identity,
     IdentitySpec,
     IdentityTable,
@@ -44,6 +45,24 @@ BUILTIN_PREFIX = "zzz-gitops-test-"
 BUILTIN_REASON = "live e2e harness throwaway records (built in; always present)"
 _MIN_PREFIX = 4
 _PREFIXES_KEY = "name_prefixes"
+
+
+class NamePrefix(Protocol):
+    """A name prefix entry: the prefix, and its file line (`None` = built-in)."""
+
+    @property
+    def prefix(self) -> str: ...
+
+    @property
+    def line(self) -> int | None: ...
+
+
+def active_prefixes[P: NamePrefix](prefixes: Iterable[P], scope: str | None) -> list[P]:
+    """The prefixes in force for a run. Only the built-in prefix has a scoped exemption:
+    a run whose `scope` starts with it may write the harness's records. A file prefix
+    applies under every scope."""
+    exempt = bool(scope) and scope.startswith(BUILTIN_PREFIX)
+    return [p for p in prefixes if not (exempt and p.line is None)]
 
 
 @dataclass(frozen=True)
@@ -84,11 +103,8 @@ class IgnoreList:
         return "built-in" if match.line is None else f"{self.file}:{match.line}"
 
     def active_prefixes(self, scope: str | None) -> list[IgnorePrefix]:
-        """The prefixes in force for a run. Only the built-in prefix has a scoped
-        exemption: a run whose `scope` starts with it may write the harness's
-        records. A file prefix applies under every scope."""
-        exempt = bool(scope) and scope.startswith(BUILTIN_PREFIX)
-        return [p for p in self.prefixes if not (exempt and p.line is None)]
+        """The prefixes in force for a run (`active_prefixes`)."""
+        return active_prefixes(self.prefixes, scope)
 
     def match(
         self,
@@ -238,6 +254,67 @@ def ignore_conflicts[D, L, R](
     row that resolves to none; `describe` names a desired row in a message (default:
     its label)."""
     describe = describe or schema.label
+    n = schema.nouns
+    failures: list[str] = []
+    reports: list[str] = []
+    for c in excluded_collisions(
+        ignored,
+        entries,
+        desired,
+        table,
+        schema=schema,
+        spec=spec,
+        found_dataset=found_dataset,
+        record_keys=record_keys,
+        record_live_id=record_live_id,
+        fallback_id=fallback_id,
+        implicit=implicit,
+    ):
+        name = describe(c.desired)
+        label = schema.live_label(c.live)
+        if c.own_stub:
+            reports.append(
+                f"stub '{name}' is for ignored {n.destination} {n.record} '{label}': "
+                "the next refresh drops it"
+            )
+            continue
+        match = ignore.match(schema.live_id(c.live), label, scope=scope)
+        where = ignore.where(match) if match is not None else ignore.file
+        failures.append(
+            f"desired record '{name}' shares {c.hit.key} '{c.hit.value}' with ignored "
+            f"{n.destination} {n.record} '{label}' ({where}). Remove that entry or change {name}."
+        )
+    return failures, reports
+
+
+@dataclass(frozen=True)
+class Collision[D, L]:
+    """An excluded live row that resolves to a desired row's identity. `own_stub`: the
+    desired row is the destination-owned stub of this same live row."""
+
+    live: L
+    desired: D
+    hit: Hit
+    own_stub: bool
+
+
+def excluded_collisions[D, L, R](
+    excluded: list[L],
+    entries: list[DatasetRecord[R]],
+    desired: list[D],
+    table: IdentityTable,
+    *,
+    schema: RecordSchema[D, L],
+    spec: IdentitySpec,
+    found_dataset: str,
+    record_keys: Callable[[DatasetRecord[R]], ItemKeys],
+    record_live_id: Callable[[R], str | None],
+    fallback_id: Callable[[DatasetRecord[R]], str],
+    implicit: Callable[[D, set[str]], Identity],
+) -> list[Collision[D, L]]:
+    """Each excluded (ignored or hidden) live row that resolves to an identity with a
+    desired row, in order; the shared core of `ignore_conflicts` and
+    `hidden.hidden_conflicts`."""
     full = with_implicit(table, desired, spec, keys=schema.desired_keys, implicit=implicit)
     row_for: dict[str, D] = {}
     for d in desired:
@@ -252,31 +329,17 @@ def ignore_conflicts[D, L, R](
         hit = resolve(record_keys(e), full, spec)
         cid = hit.canonical_id if hit is not None else fallback_id(e)
         stub_ids.setdefault(cid, set()).add(live_id)
-    n = schema.nouns
-    failures: list[str] = []
-    reports: list[str] = []
-    for lv in ignored:
+    out: list[Collision[D, L]] = []
+    for lv in excluded:
         hit = resolve(schema.live_keys(lv), full, spec)
         if hit is None or hit.canonical_id not in row_for:
             continue
         d = row_for[hit.canonical_id]
-        name = describe(d)
-        label = schema.live_label(lv)
-        if schema.destination_owned(d) and schema.live_id(lv) in stub_ids.get(
+        own_stub = schema.destination_owned(d) and schema.live_id(lv) in stub_ids.get(
             hit.canonical_id, set()
-        ):
-            reports.append(
-                f"stub '{name}' is for ignored {n.destination} {n.record} '{label}': "
-                "the next refresh drops it"
-            )
-            continue
-        match = ignore.match(schema.live_id(lv), label, scope=scope)
-        where = ignore.where(match) if match is not None else ignore.file
-        failures.append(
-            f"desired record '{name}' shares {hit.key} '{hit.value}' with ignored "
-            f"{n.destination} {n.record} '{label}' ({where}). Remove that entry or change {name}."
         )
-    return failures, reports
+        out.append(Collision(lv, d, hit, own_stub))
+    return out
 
 
 def stale_ignore[L](

@@ -1,6 +1,7 @@
 """`run_check`: the plan guard a CI job keys off, and the offline integrity checks.
 
-A check splits live rows once into managed and ignored (`ignore.partition_live`);
+A check splits live rows once into managed and ignored (`ignore.partition_live`, or
+`hidden.partition_hidden` when the run is given `hidden`);
 drift, the plan, untracked values and stale retire entries see only the managed set.
 It fails (`EXIT_DRIFT`) on:
 
@@ -9,7 +10,8 @@ It fails (`EXIT_DRIFT`) on:
 - a plan-time abort, a planner error or an unacknowledged destructive change
   (`deploy.plan_deploy`, the planner `deploy` runs);
 - a retire entry that can no longer do its job (`fieldplan.stale_retire`);
-- an ignored row that resolves to a desired row's identity (`ignore.ignore_conflicts`);
+- an ignored row that resolves to a desired row's identity (`ignore.ignore_conflicts`),
+  or, with `hidden` in place of `ignore`, a hidden one (`hidden.hidden_conflicts`);
 - a live row whose keys reach two identities;
 - with the dataset records supplied, an orphan: a managed live row that no record
   resolves to.
@@ -36,6 +38,7 @@ from .deploy import DeployPlan, plan_deploy
 from .drift import DriftReport, detect_drift
 from .exitcodes import EXIT_DRIFT, EXIT_OK
 from .fieldplan import Untracked, stale_retire, untracked_values
+from .hidden import Hidden, hidden_conflicts, partition_hidden
 from .identity import (
     Identity,
     IdentitySpec,
@@ -215,6 +218,19 @@ def _state_ignored[D](
     return lid in ignored_ids or ignore.match(lid, schema.label(s), scope=scope) is not None
 
 
+def _state_hidden[D](
+    s: D,
+    hidden_ids: set[str],
+    hidden: Hidden,
+    scope: str | None,
+    schema: RecordSchema[D, Any],
+) -> bool:
+    mark = schema.mark(s)
+    if mark is None:
+        return False
+    return mark.live_id in hidden_ids or hidden.prefix_for(schema.label(s), scope=scope) is not None
+
+
 def _no_hooks() -> DatasetHooks[Any]:
     """Callbacks `ignore_conflicts` never calls when there are no records."""
 
@@ -240,6 +256,7 @@ def run_check[D, L, R](
     hooks: DatasetHooks[R] | None = None,
     other_live: list[L] | None = None,
     held: Mapping[str, str] | None = None,
+    hidden: Hidden | None = None,
 ) -> CheckResult[D, L]:
     """Drift, the plan and every live check, as one `CheckResult`.
 
@@ -248,14 +265,44 @@ def run_check[D, L, R](
     the check also fails orphans and reports unused identities and records with no
     identity. `entries=None` skips those checks. `hooks` is required with `entries`.
     `other_live` are further live rows outside this run (a scoped run's out-of-scope
-    rows) whose exclusive values still count as held. `held` passes to `plan_deploy`."""
+    rows) whose exclusive values still count as held. `held` passes to `plan_deploy`.
+
+    `hidden` replaces `ignore`: live rows are split by `partition_hidden`, the hidden rows
+    go in `CheckResult.ignored`, conflicts come from `hidden_conflicts`, and there are no
+    stale-ignore reports. Passing both raises `ValueError`."""
     if entries is not None and hooks is None:
         raise ValueError("run_check: entries need hooks to read them")
-    ignore = ignore if ignore is not None else IgnoreList("")
-    managed, ignored = partition_live(live, ignore, schema, scope=scope)
-    ignored_ids = {schema.live_id(lv) for lv in ignored}
-    state = [s for s in state if not _state_ignored(s, ignored_ids, ignore, scope, schema)]
+    if ignore is not None and hidden is not None:
+        raise ValueError("run_check: pass ignore and hidden, not both")
     bound = {"schema": schema, "spec": spec, "implicit": implicit}
+    h = hooks if hooks is not None else _no_hooks()
+    conflict_hooks = {
+        "found_dataset": h.found_dataset,
+        "record_keys": h.keys,
+        "record_live_id": h.live_id,
+        "fallback_id": h.record_id,
+        "describe": h.describe,
+        "scope": scope,
+    }
+    if hidden is not None:
+        managed, ignored = partition_hidden(
+            live, hidden, table, schema=schema, spec=spec, scope=scope
+        )
+        hidden_ids = {schema.live_id(lv) for lv in ignored}
+        state = [s for s in state if not _state_hidden(s, hidden_ids, hidden, scope, schema)]
+        failures, reports = hidden_conflicts(
+            ignored, hidden, entries or [], desired, table, **bound, **conflict_hooks
+        )
+    else:
+        ignore = ignore if ignore is not None else IgnoreList("")
+        managed, ignored = partition_live(live, ignore, schema, scope=scope)
+        ignored_ids = {schema.live_id(lv) for lv in ignored}
+        state = [s for s in state if not _state_ignored(s, ignored_ids, ignore, scope, schema)]
+        failures, reports = ignore_conflicts(
+            ignored, ignore, entries or [], desired, table, **bound, **conflict_hooks
+        )
+        if scope is None:  # a scoped run sees only its own rows: every entry would look stale
+            reports += stale_ignore(ignore, live, schema)
     owned: Collection[str] = {
         schema.live_id(lv)
         for d, lv in pair_rows(desired, managed, table, **bound).pairs
@@ -274,24 +321,7 @@ def run_check[D, L, R](
     )
     untracked = untracked_values(desired, managed, table, retire, **bound)
     stale = stale_retire(desired, managed, table, retire, **bound)
-    h = hooks if hooks is not None else _no_hooks()
-    failures, reports = ignore_conflicts(
-        ignored,
-        ignore,
-        entries or [],
-        desired,
-        table,
-        **bound,
-        found_dataset=h.found_dataset,
-        record_keys=h.keys,
-        record_live_id=h.live_id,
-        fallback_id=h.record_id,
-        describe=h.describe,
-        scope=scope,
-    )
     failures += live_identity_conflicts(managed, table, schema=schema, spec=spec)
-    if scope is None:  # a scoped run sees only its own rows: every entry would look stale
-        reports += stale_ignore(ignore, live, schema)
     found: list[L] = []
     if entries is not None and hooks is not None:
         found = orphans(managed, table, entries, schema=schema, spec=spec, hooks=hooks)

@@ -28,9 +28,11 @@ from gitops_engine.check import (
 from gitops_engine.datasets import DatasetRecord
 from gitops_engine.exitcodes import EXIT_DRIFT, EXIT_OK, EXIT_OPERROR
 from gitops_engine.fieldplan import FieldChange
+from gitops_engine.hidden import Hidden
 from gitops_engine.identity import Identity, IdentityTable, ItemKeys
 from gitops_engine.ignore import IgnoreFormat, IgnoreList, load_ignore
 from gitops_engine.manifest import write_manifest
+from gitops_engine.overrides import HiddenPrefix
 
 SCHEMA = ToySchema()
 PRIMARY, FOUND = "origin", "found"
@@ -241,6 +243,45 @@ def test_ignored_state_rows_are_dropped_by_id_and_by_prefix(tmp_path):
     state = [recorded(gear), recorded(scratch)]
     res = check([want()], state, [gear], ignore=ign)  # scratch row gone from the store
     assert not res.drift.any() and res.code == EXIT_OK
+
+
+def _hidden(ids=None) -> Hidden:
+    prefixes = [
+        HiddenPrefix("zzz-gitops-test-", "built in", None),
+        HiddenPrefix("test-", "scratch", 4),
+    ]
+    return Hidden("overrides.yaml", dict(ids or {}), prefixes)
+
+
+def test_run_check_hidden_row_is_not_orphan_or_drift():
+    tbl = table(gear={"values": {"tags": ["red"]}}, w_h={"values": {"tags": ["hid"]}})
+    gear = live()
+    then = live("Secret", live_id="L_h", ids=(), tags=("hid",))
+    now = replace(then, name="Secret Ltd", size=7, version="v5")
+    scratch = live("test-1", live_id="L_t", ids=(), tags=("t",))
+    state = [recorded(gear), recorded(then), recorded(scratch)]
+    kw = {"ignore": None, "entries": [record()]}
+    res = check([want()], state, [gear, now], tbl, hidden=_hidden({"w_h": "a test"}), **kw)
+    assert res.code == EXIT_OK, (res.failures, res.drift, res.orphans)
+    assert not res.drift.any() and res.orphans == [] and res.failures == []
+    assert [lv.live_id for lv in res.ignored] == ["L_h"]
+    assert not any("stale ignore" in r for r in res.reports)
+    # control: without the hidden entry the edited row is drift and an orphan
+    res = check([want()], state, [gear, now], tbl, hidden=_hidden(), **kw)
+    assert res.drift.changed and res.orphans == [now] and res.code == EXIT_DRIFT
+
+
+def test_run_check_hidden_prefix_on_desired_identity_fails():
+    gear = live()
+    sand = live("test-gear", live_id="L_t", ids=(), tags=("red",))
+    res = check([want()], [], [gear, sand], ignore=None, hidden=_hidden())
+    assert res.code == EXIT_DRIFT and len(res.failures) == 1
+    assert "(prefix 'test-', overrides.yaml:4)" in res.failures[0]
+
+
+def test_run_check_rejects_ignore_and_hidden():
+    with pytest.raises(ValueError, match="ignore and hidden"):
+        check([want()], [], [live()], ignore=IgnoreList(FMT.file), hidden=_hidden())
 
 
 # ---- orphans, unused identities, records with no identity ----

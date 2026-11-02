@@ -88,6 +88,33 @@ def test_apply_aborts_row_ignored_at_write_time(tmp_path):
     assert [why for _, _, why in p.aborts] == ["ignored at write time: frozen"]
 
 
+def test_apply_exclude_aborts_at_write_time(tmp_path):
+    p = plan([want(size=5)], [live(size=1)])
+    # renamed between plan and apply into a hidden prefix
+    dest = ToyDestination([live("test-gear", size=1)])
+    seen: list[str] = []
+
+    def exclude(lv):
+        seen.append(lv.name)
+        return "scratch" if lv.name.startswith("test-") else None
+
+    apply(p, dest, tmp_path, exclude=exclude)
+    assert seen == ["test-gear"] and writes(dest) == []
+    assert [why for _, _, why in p.aborts] == ["hidden at write time: scratch"]
+    # exclude replaces the ignore match: the built-in prefix no longer aborts by itself
+    name = "zzz-gitops-test-gear"
+    p = plan([want(name, size=5)], [live(name, size=1)])
+    dest = ToyDestination([live(name, size=1)])
+    res = apply(p, dest, tmp_path, exclude=lambda lv: None)
+    assert res.failure is None and p.aborts == [] and len(writes(dest)) == 1
+
+
+def test_apply_rejects_ignore_and_exclude(tmp_path):
+    p = plan([want(size=5)], [live(size=1)])
+    with pytest.raises(ValueError, match="ignore and exclude"):
+        apply(p, ToyDestination([live(size=1)]), tmp_path, ignore=IgnoreList(""), exclude=str)
+
+
 def test_apply_default_ignore_is_the_builtin_prefix(tmp_path):
     p = plan([want("zzz-gitops-test-gear", size=5)], [live("zzz-gitops-test-gear", size=1)])
     dest = ToyDestination([live("zzz-gitops-test-gear", size=1)])

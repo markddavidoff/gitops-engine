@@ -3,8 +3,8 @@
 A consumer declares its records once (`RecordSchema`, `IdentitySpec`) and supplies a
 `Destination`; the engine plans by identity and per-field policy, checks for drift,
 applies under check-and-set with a snapshot, and restores. Submodules hold the rest:
-datasets, manifests, writers, merge, found stubs, the state mirror, ignore, overrides
-and retire.
+datasets, manifests, writers, merge, found stubs, the state mirror, ignore, overrides,
+hidden rows and retire.
 """
 
 from .check import CheckResult, DatasetHooks, identity_offline_errors, manifest_errors, run_check
