@@ -26,7 +26,7 @@ from .schema import (
 )
 from .snapshot import RestoreResult, restore
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 __all__ = [
     "EXIT_DRIFT",

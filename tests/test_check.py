@@ -126,7 +126,7 @@ def check(desired, state, live_rows, tbl=None, **kw) -> CheckResult:
 
 def test_exit_codes_keep_their_values():
     assert (EXIT_OK, EXIT_OPERROR, EXIT_DRIFT) == (0, 2, 3)
-    assert gitops_engine.__version__ == "0.2.0"
+    assert gitops_engine.__version__ == "0.3.0"
     assert gitops_engine.EXIT_DRIFT == EXIT_DRIFT and gitops_engine.run_check is run_check
 
 
