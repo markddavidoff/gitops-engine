@@ -544,3 +544,108 @@ def test_settings_step_writes_both_environments(tmp_path):
     code, outputs, err = _run_step(settings, tmp_path, {})
     assert code == 0, err
     assert outputs == {"deploy_environment": "deploy-env", "readonly_environment": "read-env"}
+
+
+def _stub_state_pr_tools(tmp_path: Path) -> Path:
+    """`gh` answers the bot lookup and logs `pr create`; `git push` is logged, not run."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    log = tmp_path / "pr-calls"
+    gh = bin_dir / "gh"
+    gh.write_text(f'#!/bin/sh\necho "gh $*" >> "{log}"\n[ "$1" = api ] && echo 1\nexit 0\n')
+    gh.chmod(0o755)
+    real_git = subprocess.run(
+        ["which", "git"], capture_output=True, text=True, check=True
+    ).stdout.strip()
+    git = bin_dir / "git"
+    git.write_text(
+        f'#!/bin/sh\nif [ "$1" = push ]; then echo "git $*" >> "{log}"; exit 0; fi\n'
+        f'exec "{real_git}" "$@"\n'
+    )
+    git.chmod(0o755)
+    return log
+
+
+def _state_pr_repo(tmp_path: Path, files: dict[str, str]) -> Path:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git = ["git", "-C", str(repo)]
+    subprocess.run([*git, "init", "-q", "-b", "main"], check=True)
+    subprocess.run([*git, "config", "user.email", "t@example.test"], check=True)
+    subprocess.run([*git, "config", "user.name", "t"], check=True)
+    for name in files:
+        (repo / name).parent.mkdir(parents=True, exist_ok=True)
+        (repo / name).write_text("old\n")
+    (repo / "README").write_text("x\n")
+    subprocess.run([*git, "add", "--all"], check=True)
+    subprocess.run([*git, "commit", "-q", "-m", "base"], check=True)
+    for name, text in files.items():
+        (repo / name).write_text(text)
+    return repo
+
+
+def _run_state_pr_step(tmp_path, monkeypatch, repo: Path, paths: dict[str, str]):
+    step = _step_named(_load()["jobs"]["deploy"], "Open the state PR")
+    log = _stub_state_pr_tools(tmp_path)
+    monkeypatch.chdir(repo)
+    env = {
+        "GH_TOKEN": "t",
+        "APP_SLUG": "app",
+        "OUTCOME": "success",
+        "MODE": "deploy",
+        "BASE": "main",
+        "REPO": "o/r",
+        "RUN_ID": "1",
+        "RUN_ATTEMPT": "1",
+        "RUN_URL": "https://example.test/run",
+        "DATA_DIR": paths["data"],
+        "STATE_DIR": paths["state"],
+        "SNAPSHOT_DIR": paths["snap"],
+    }
+    code, _, err = _run_step(step, tmp_path, env)
+    committed = subprocess.run(
+        ["git", "-C", str(repo), "show", "--name-only", "--format=", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=False,
+    ).stdout.split()
+    return code, err, committed, log.read_text() if log.exists() else ""
+
+
+def test_state_pr_step_env_has_every_directory_it_stages():
+    step = _step_named(_load()["jobs"]["deploy"], "Open the state PR")
+    assert {"DATA_DIR", "STATE_DIR", "SNAPSHOT_DIR"} <= set(step["env"])
+    assert "steps.paths.outputs.data_dir" in step["env"]["DATA_DIR"]
+
+
+def test_state_pr_stages_the_data_dir(tmp_path, monkeypatch):
+    """A file the tool changed under the data directory outside the state and snapshot
+    directories (a recorded decision in a curated file) lands in the state PR."""
+    repo = _state_pr_repo(
+        tmp_path,
+        {"data/state/a.yaml": "new\n", "data/snaps/s.yaml": "new\n", "data/curated.yaml": "new\n"},
+    )
+    paths = {"data": "data", "state": "data/state", "snap": "data/snaps"}
+    code, err, committed, log = _run_state_pr_step(tmp_path, monkeypatch, repo, paths)
+    assert code == 0, err
+    assert sorted(committed) == ["data/curated.yaml", "data/snaps/s.yaml", "data/state/a.yaml"]
+    assert "pr create" in log
+
+
+def test_state_pr_stages_state_and_snapshot_dirs_outside_the_data_dir(tmp_path, monkeypatch):
+    repo = _state_pr_repo(
+        tmp_path, {"data/c.yaml": "new\n", "st/a.yaml": "new\n", "sn/s.yaml": "new\n"}
+    )
+    paths = {"data": "data", "state": "st", "snap": "sn"}
+    code, err, committed, _ = _run_state_pr_step(tmp_path, monkeypatch, repo, paths)
+    assert code == 0, err
+    assert sorted(committed) == ["data/c.yaml", "sn/s.yaml", "st/a.yaml"]
+
+
+def test_state_pr_opens_nothing_when_no_file_changed(tmp_path, monkeypatch):
+    repo = _state_pr_repo(tmp_path, {"data/c.yaml": "old\n"})
+    paths = {"data": "data", "state": "data/state", "snap": "data/snaps"}
+    code, err, committed, log = _run_state_pr_step(tmp_path, monkeypatch, repo, paths)
+    assert code == 0, err
+    assert sorted(committed) == ["README", "data/c.yaml"]  # HEAD is still the base commit
+    assert "pr create" not in log
