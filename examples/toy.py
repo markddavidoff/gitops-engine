@@ -16,6 +16,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any
 
 from gitops_engine.identity import Identity, IdentitySpec, ItemKeys, MatchKey
+from gitops_engine.overrides import OverridesFormat
 from gitops_engine.schema import (
     Always,
     FieldSpec,
@@ -88,6 +89,11 @@ TOY_IDENTITY_SPEC = IdentitySpec(
     ),
     destination_source="s2",
     file_order=("names", "tags", "sources"),
+)
+
+
+TOY_OVERRIDES = OverridesFormat(
+    "toy-overrides.yaml", "# toy\n", "widgets", "store_id", ("name", "status", "size"), ("tags",)
 )
 
 

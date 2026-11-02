@@ -41,7 +41,7 @@ from .identity import (
 from .schema import RecordSchema
 
 BUILTIN_PREFIX = "zzz-gitops-test-"
-_BUILTIN_REASON = "live e2e harness throwaway records (built in; always present)"
+BUILTIN_REASON = "live e2e harness throwaway records (built in; always present)"
 _MIN_PREFIX = 4
 _PREFIXES_KEY = "name_prefixes"
 
@@ -77,7 +77,7 @@ class IgnoreList:
     file: str  # the file name messages cite
     entries: list[IgnoreEntry] = field(default_factory=list)
     prefixes: list[IgnorePrefix] = field(
-        default_factory=lambda: [IgnorePrefix(BUILTIN_PREFIX, _BUILTIN_REASON, None)]
+        default_factory=lambda: [IgnorePrefix(BUILTIN_PREFIX, BUILTIN_REASON, None)]
     )
 
     def where(self, match: IgnoreEntry | IgnorePrefix) -> str:
@@ -313,7 +313,7 @@ def ignored_lines[L](
     return lines
 
 
-def _round_trip_yaml() -> YAML:
+def round_trip_yaml() -> YAML:
     """The identity file's round-trip style (`identity_store._yaml`), so both curated files
     keep one indentation: mappings 2, block sequences 4 with the dash offset 2."""
     yml = YAML(typ="rt")
@@ -351,7 +351,7 @@ def append_ignore(path: Path, fmt: IgnoreFormat, *, live_id: str, name: str, rea
             [
                 CommentedMap(
                     prefix=DoubleQuotedScalarString(BUILTIN_PREFIX),
-                    reason=_BUILTIN_REASON,
+                    reason=BUILTIN_REASON,
                 )
             ]
         )
@@ -370,7 +370,7 @@ def append_ignore(path: Path, fmt: IgnoreFormat, *, live_id: str, name: str, rea
     entries.append(entry)
     buf = StringIO()
     buf.write(prefix_text)
-    _round_trip_yaml().dump(data, buf)
+    round_trip_yaml().dump(data, buf)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(buf.getvalue())
