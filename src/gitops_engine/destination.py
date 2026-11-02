@@ -38,7 +38,9 @@ class Destination[L](Protocol):
     def list_live(self) -> list[L]: ...
 
     def get(self, live_id: str) -> L | None:
-        """The row as it is now, or None when it is gone."""
+        """The row as it is now, or None only when the destination reports it not
+        found. Any other failure (a network or API error) raises `DestinationError`:
+        a deletion is confirmed by `None`, so an error must never read as gone."""
         ...
 
     def preflight(self, writes: list[dict[str, Any]], *, restoring: bool = False) -> None:

@@ -219,3 +219,11 @@ def test_record_written_keeps_v010_bytes(tmp_path):
     path.write_text(src)
     record_written(path, "lin_b", None, schema=SCHEMA)  # rewrite with no change
     assert path.read_text() == src
+
+
+def test_restore_get_error_is_failure(tmp_path):
+    path = _snap(tmp_path, [live(live_id="L1"), live("Cog", live_id="L2")])
+    dest = ToyDestination([live(live_id="L1"), live("Cog", live_id="L2")], get_errors={"L1"})
+    res = restore(path, dest, schema=SCHEMA)
+    assert res.failure is not None and res.failure.startswith("L1: re-read failed: ")
+    assert res.restored == [] and updates(dest) == []

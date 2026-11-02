@@ -289,8 +289,9 @@ def apply_deploy[D, L](
     when a planned change is destructive), record the written version in the
     snapshot, then verify the returned row.
 
-    A destination error, a guard refusal or a mismatch sets `failure` and stops: the
-    later updates are recorded in `plan.aborts` as not attempted. A row the current
+    A destination error (the re-read's included), a guard refusal or a mismatch sets
+    `failure` and stops: the later updates are recorded in `plan.aborts` as not
+    attempted. A row the current
     `ignore` list matches (default: the built-in prefix) is aborted, never written.
     `exclude`, when given, replaces that match: a row it gives a reason for (the current
     row, e.g. `hidden.live_reason` bound to the run) is aborted. Passing both raises
@@ -330,7 +331,11 @@ def apply_deploy[D, L](
         changes = plan.changes.get(live_id, [])
         if not changes:
             continue
-        cur = dest.get(live_id)  # write-time re-read (check-and-set)
+        try:
+            cur = dest.get(live_id)  # write-time re-read (check-and-set)
+        except DestinationError as e:
+            result.failure = f"{schema.label(d)}: re-read failed: {e}"
+            continue
         if cur is None:
             plan.aborts.append((d, lv0, "gone at write time"))
             continue

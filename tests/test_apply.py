@@ -417,3 +417,15 @@ def test_apply_clear_sends_retire(tmp_path):
     assert writes(dest) == [("update", "L1", {"size": None}, True)]
     assert res.failure is None
     assert dest.rows["L1"].size is None
+
+
+def test_apply_get_error_is_failure(tmp_path):
+    rows = [live("A", live_id="LA", size=1), live("B", live_id="LB", size=1)]
+    p = plan([want("A", size=2), want("B", size=2)], rows)
+    dest = ToyDestination(rows, get_errors={"LA"})
+    res = apply(p, dest, tmp_path)
+    assert res.failure is not None and res.failure.startswith("A: re-read failed: ")
+    assert writes(dest) == []
+    assert [(d.name, why) for d, _, why in p.aborts] == [
+        ("B", "not attempted: apply stopped at an earlier failure"),
+    ]
