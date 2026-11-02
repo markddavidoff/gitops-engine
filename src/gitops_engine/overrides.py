@@ -739,6 +739,24 @@ class OverridesStore:
         self._prune(cid, "pending")
         return self._changed()
 
+    def drop_pending_values(self, cid: str, field: str, values: Iterable[str]) -> bool:
+        """Drop each of `values` from the list field's pending adds, keeping the rest;
+        the pending key goes once it is empty."""
+        self._need_list(field)
+        key = f"{field}{PENDING_ADD}"
+        entry = self._find(cid)
+        pending = entry.get("pending") if entry is not None else None
+        have = pending.get(key) if pending is not None else None
+        if have is None:
+            return False
+        drop = [v for v in values if v in have]
+        if not drop:
+            return False
+        for value in drop:
+            have.remove(value)
+        self._prune(cid, "pending", key)
+        return self._changed()
+
     def hide(self, cid: str, reason: str) -> bool:
         reason = reason.strip()
         if not reason:

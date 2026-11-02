@@ -204,6 +204,23 @@ def test_pending_scalar_and_list(tmp_path: Path) -> None:
     assert "w1" not in store.overrides.entries
 
 
+def test_drop_pending_values_keeps_the_other_adds(tmp_path: Path) -> None:
+    path = tmp_path / FMT.file
+    store = OverridesStore(path, FMT)
+    store.add_pending("w1", "tags", ["a", "b"])
+    store.set_pending("w1", "size", 9)
+    assert store.drop_pending_values("w1", "tags", ["a", "zz"])
+    assert store.overrides.entries["w1"].pending == {"size": 9, "tags_add": ["b"]}
+    assert not store.drop_pending_values("w1", "tags", ["a"])
+    assert not store.drop_pending_values("w2", "tags", ["a"])
+    assert store.drop_pending_values("w1", "tags", ["b"])
+    assert store.overrides.entries["w1"].pending == {"size": 9}
+    store.drop_pending("w1", "size")
+    assert "w1" not in store.overrides.entries
+    with pytest.raises(ValueError, match="size is not a list field"):
+        store.drop_pending_values("w1", "size", [9])
+
+
 def test_mark_deleted_and_prefix_reload(tmp_path: Path) -> None:
     path = tmp_path / FMT.file
     store = OverridesStore(path, FMT)
